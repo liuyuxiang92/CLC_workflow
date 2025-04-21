@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: clc-workflow
+Version: 0.1
+Summary: Screening workflow for perovskites applied in chemical looping beyond combustion
+Author: Yuxiang Liu
+Requires-Dist: numpy
+Requires-Dist: pandas
