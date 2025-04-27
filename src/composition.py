@@ -3,7 +3,7 @@ import pandas as pd
 from itertools import product
 
 def generate_valid_combinations(
-    formula_template,
+    formula_extra_part,
     site_vars,
     site_dopants,
     site_values,
@@ -22,27 +22,27 @@ def generate_valid_combinations(
 
     combinations = []
 
-    def add_entry(x, y, A=None, B=None):
+    def add_entry(x, y, A_dopant=None, B_dopant=None):
         parts = []
 
         if x != 1.0:
             parts.append(f"{A_base}{1 - x:.3f}")
         if x != 0.0 and A:
-            parts.append(f"{A}{x:.3f}")
+            parts.append(f"{A_dopant}{x:.3f}")
 
         if y != 1.0:
             parts.append(f"{B_base}{1 - y:.3f}")
         if y != 0.0 and B:
-            parts.append(f"{B}{y:.3f}")
+            parts.append(f"{B_dopant}{y:.3f}")
 
-        parts.append("O3")
+        parts.append(formula_extra_part)
         formula = "".join(parts)
 
         combinations.append({
             "x": round(x, 3), "1_x": round(1 - x, 3),
             "y": round(y, 3), "1_y": round(1 - y, 3),
             f"{A_site}_base": A_base, f"{B_site}_base": B_base,
-            f"{A_site}_dopant": A, f"{B_site}_dopant": B,
+            f"{A_site}_dopant": A_dopant, f"{B_site}_dopant": B_dopant,
             "formula": formula
         })
 
