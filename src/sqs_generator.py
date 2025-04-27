@@ -1,6 +1,7 @@
 import os
 import subprocess
 import numpy as np
+import shutil
 from pymatgen.io.vasp import Poscar
 from pymatgen.core import Structure
 
@@ -110,6 +111,18 @@ def run_mcsqs(directory, n_atoms, timeout_sec):
     finally:
         os.chdir(cwd)
 
+def run_mcsqs_rc(directory, timeout_sec):
+    cwd = os.getcwd()
+    os.chdir(directory)
+    try:
+        subprocess.run(["mcsqs", f"-rc"], check=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        print(f"[TIMEOUT] mcsqs -rc timed out in {directory} after {timeout_sec} seconds.")
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] mcsqs -rc structure generation failed in {directory}: {e}")
+    finally:
+        os.chdir(cwd)
+
 
 def convert_bestsqs_to_poscar(directory):
     bestsqs_path = os.path.join(directory, "bestsqs.out")
@@ -143,6 +156,7 @@ def generate_all_poscars(
     delta_list,
     n_atoms,
     timeout_sec,
+    select_cubic=False,
     clean_dir=True,
     output_root="sqs_structures"):
 
@@ -185,6 +199,9 @@ def generate_all_poscars(
             generate_rndstr_in(structure, rndstr_path, site_species, vacancy_frac)
             run_corrdump(full_path)
             run_mcsqs(full_path, n_atoms, timeout_sec)
+            if(select_cubic):
+               replace_sqscell_with_cubic(full_path)
+               run_mcsqs_rc(full_path, timeout_sec)
             convert_bestsqs_to_poscar(full_path)
 
             print(f"[INFO] Finished: {full_path}/POSCAR")
@@ -193,3 +210,67 @@ def generate_all_poscars(
                print(f"[INFO Clean files in {full_path}]")
 
 
+
+def replace_sqscell_with_cubic(sqscell_dir, tolerance=1e-3):
+    """
+    From the given sqscell.out, select cubic matrices (equal vector lengths and 90-degree angles),
+    and rewrite the file to only include these matrices.
+
+    Args:
+        sqscell_dir (str): Directory containing sqscell.out
+        tolerance (float): Allowed numerical tolerance (default 1e-3)
+    """
+    sqscell_path = os.path.join(sqscell_dir, 'sqscell.out')
+    backup_path = os.path.join(sqscell_dir, 'sqscell_old.out')
+
+    if not os.path.isfile(sqscell_path):
+        raise FileNotFoundError(f"{sqscell_path} not found.")
+
+    shutil.move(sqscell_path, backup_path)
+
+    with open(backup_path, 'r') as f:
+        lines = f.readlines()
+
+    if not lines:
+        raise ValueError(f"Empty file: {backup_path}")
+
+    n_matrices = int(lines[0].strip())
+
+    matrices_raw, current_matrix = [], []
+    for line in lines[1:]:
+        if line.strip() == '':
+            continue
+        current_matrix.append(line.rstrip())
+        if len(current_matrix) == 3:
+            matrices_raw.append(current_matrix)
+            current_matrix = []
+
+    if len(matrices_raw) != n_matrices:
+        raise ValueError(f"Expected {n_matrices} matrices, found {len(matrices_raw)}")
+
+    matrices_float = []
+    for mat_raw in matrices_raw:
+        mat = []
+        for row in mat_raw:
+            mat.append([float(x) for x in row.split()])
+        matrices_float.append(np.array(mat))
+
+    selected_raw = []
+    for raw, mat in zip(matrices_raw, matrices_float):
+        lengths = np.linalg.norm(mat, axis=1)
+        if np.all(np.abs(lengths - lengths[0]) < tolerance):
+            cos01 = np.dot(mat[0], mat[1]) / (lengths[0] * lengths[1])
+            cos02 = np.dot(mat[0], mat[2]) / (lengths[0] * lengths[2])
+            cos12 = np.dot(mat[1], mat[2]) / (lengths[1] * lengths[2])
+            if all(abs(cos) < tolerance for cos in [cos01, cos02, cos12]):
+                selected_raw.append(raw)
+
+    with open(sqscell_path, 'w') as f:
+        f.write(f"{len(selected_raw)}\n\n")
+        for idx, mat_lines in enumerate(selected_raw):
+            for line in mat_lines:
+                f.write(line + '\n')
+            if idx != len(selected_raw) - 1:
+                f.write('\n')
+
+    print(f"Selected {len(selected_raw)} cubic matrices out of {n_matrices}.")
