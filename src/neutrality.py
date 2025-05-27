@@ -65,7 +65,7 @@ def filter_charge_neutral_compositions(
         min_FB_charge = (1 - y) * Fe_min + y * B_min
         max_FB_charge = (1 - y) * Fe_max + y * B_max
 
-        overlap = not (max_FB_charge < target_charge_min or min_FB_charge > target_charge_max)
+        overlap =  (max_FB_charge > target_charge_max and min_FB_charge < target_charge_min)
         is_neutral_flags.append(overlap)
 
         if debug and not overlap:

@@ -8,6 +8,7 @@ import shutil
 import matplotlib.pyplot as plt
 import glob
 import pandas as pd
+import dpdata
 
 
 def generate_potcar_with_vaspkit(poscar_dir):
@@ -198,7 +199,7 @@ def run_kpoint_convergence_test(
 
             os.makedirs(subdir, exist_ok=True)
             #Copy INCAR from INCAR.template to destination path as INCAR
-            generate_incar_from_template(os.path.join(root_path, structure_source), os.path.join(root_path, incar_source), output_path=os.path.join(subdir, "INCAR"), spin=spin, dftu=dftu)
+            generate_incar_from_template(root_path, root_path, incar_source, subdir, spin=spin, dftu=dftu)
             #Copy POTCAR to destination POTCAR
             shutil.copy2(os.path.join(root_path, 'POTCAR'), os.path.join(subdir, "POTCAR"))
             # Copy POSCAR or CONTCAR and rename to POSCAR
@@ -206,8 +207,8 @@ def run_kpoint_convergence_test(
             #copy_inputs(root_path, subdir, structure_source, incar_source)
 
             generate_kpoints(
-                poscar_path=os.path.join(subdir, "POSCAR"),
-                output_path=os.path.join(subdir, "KPOINTS"),
+                poscar_path=subdir,
+                output_path=subdir,
                 kmesh=mesh,
                 scheme=scheme,
                 debug=debug
@@ -222,10 +223,23 @@ def run_kpoint_convergence_test(
     if debug:
         print("KPOINT convergence test setup completed.")
 
+import os
+import glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import dpdata
 
-def plot_kpoint_convergence_results(base_dir, prefix="static_kpoint*", output_plot="kpoint_convergence.png", output_csv="kpoint_convergence.csv", debug=False):
+def plot_convergence_results(
+    base_dir, 
+    prefix="kpoint*", 
+    output_plot_prefix="convergence", 
+    output_csv="convergence.csv", 
+    debug=False
+):
     """
-    Plot total energy vs. k-point mesh from OUTCARs in static_kpoint*/ or static_kspacing*/ subdirs.
+    Plot convergence: delta energy, force, and virial norm vs. k-point mesh or ENCUT.
+    Values are relative to the maximum kpoint/ENCUT result and in meV.
     """
     data = []
 
@@ -236,61 +250,125 @@ def plot_kpoint_convergence_results(base_dir, prefix="static_kpoint*", output_pl
                 print(f"[Warning] OUTCAR not found in {path}")
             continue
 
-        # Extract mesh from directory name
         dirname = os.path.basename(path)
-        if "kpoint" in dirname:
-            mesh_str = dirname.replace("static_kpoint", "")
-        elif "kspacing" in dirname:
-            mesh_str = dirname.replace("static_kspacing", "")
+        if "kpoint" in dirname.lower():
+            mode = "kpoint"
+            mesh_str = dirname.lower().replace("kpoint", "")
+            try:
+                kx, ky, kz = int(mesh_str[0]), int(mesh_str[1]), int(mesh_str[2])
+                x_value = (kx, ky, kz)
+            except Exception as e:
+                if debug:
+                    print(f"[Warning] Cannot parse kpoint mesh from {dirname}: {e}")
+                continue
+        elif "energy" in dirname.lower():
+            mode = "energy"
+            mesh_str = dirname.lower().replace("energy", "")
+            try:
+                x_value = int(mesh_str)
+            except Exception as e:
+                if debug:
+                    print(f"[Warning] Cannot parse ENCUT value from {dirname}: {e}")
+                continue
         else:
+            if debug:
+                print(f"[Warning] Directory {dirname} does not match expected naming.")
             continue
 
-        # Grep TOTEN value
-        with open(outcar_path, "r") as f:
-            lines = f.readlines()
-
-        energy = None
-        for line in reversed(lines):  # Grep from end (faster)
-            if "free  energy   TOTEN" in line:
-                match = re.search(r"TOTEN\s+=\s+(-?\d+\.\d+)", line)
-                if match:
-                    energy = float(match.group(1))
-                    break
-
-        if energy is None:
-            print(f"[Warning] No TOTEN found in {outcar_path}")
+        try:
+            system = dpdata.LabeledSystem(outcar_path, fmt='outcar')
+        except Exception as e:
+            if debug:
+                print(f"[Warning] Failed to read {outcar_path}: {e}")
             continue
 
-        data.append((mesh_str, energy))
+        n_atoms = system.get_natoms()
+
+        energy = system.data['energies'][-1] / n_atoms
+        forces_flat = np.array(system.data['forces'][-1])
+        virial_tensor = np.array(system.data['virials'][-1])
+
+        force_norm = np.linalg.norm(forces_flat) / forces_flat.shape[0]/n_atoms
+        virial_norm = np.linalg.norm(virial_tensor)/n_atoms
+
+        if debug:
+            print(f"Read: {dirname} -> Energy {energy:.6f} eV, Force {force_norm:.6f} eV/A, Virial {virial_norm:.6f} eV")
+
+        data.append((x_value, energy, force_norm, virial_norm))
 
     if not data:
-        print("[Error] No data found.")
+        print("[Error] No valid data found.")
         return
 
-    # Sort by mesh size (e.g., "222" -> [2,2,2] -> product = 8)
-    def mesh_product(mesh_str):
-        try:
-            return int(mesh_str[0]) * int(mesh_str[1]) * int(mesh_str[2])
-        except:
-            return float("inf")
+    # Sort data
+    if mode == "kpoint":
+        data.sort(key=lambda x: (x[0][0], x[0][1], x[0][2]))
+    else:
+        data.sort(key=lambda x: x[0])
 
-    data.sort(key=lambda x: mesh_product(x[0]))
+    x_values, energies, force_norms, virial_norms = zip(*data)
 
-    meshes, energies = zip(*data)
+    # Reference (maximum x) value for delta
+    ref_energy = energies[-1]
+    ref_force = force_norms[-1]
+    ref_virial = virial_norms[-1]
 
+    delta_energies = [(e - ref_energy) * 1000 for e in energies]     # eV -> meV
+    delta_forces = [(f - ref_force) * 1000 for f in force_norms]
+    delta_virials = [(v - ref_virial) * 1000 for v in virial_norms]
+
+    if mode == "kpoint":
+        x_labels = [f"{kx}{ky}{kz}" for (kx, ky, kz) in x_values]
+        x_ticks = list(range(len(x_labels)))
+    else:
+        x_labels = [str(x) for x in x_values]
+        x_ticks = x_values
+
+    # --- Plot delta energy ---
     plt.figure(figsize=(8, 6))
-    plt.plot(meshes, energies, marker="o", linestyle="-")
-    plt.xlabel("K-point mesh")
-    plt.ylabel("Total energy (eV)")
-    plt.title("K-point Convergence Test")
+    plt.plot(x_ticks, delta_energies, marker="o", linestyle="-")
+    plt.xticks(x_ticks, x_labels)
+    plt.xlabel("K-point mesh (kxkykz)" if mode == "kpoint" else "ENCUT (eV)")
+    plt.ylabel("Delta Energy per atom (meV)")
+    plt.title("Convergence: Energy")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(os.path.join(base_dir, output_plot))
+    plt.savefig(os.path.join(base_dir, f"{output_plot_prefix}_energy.png"))
     plt.close()
 
-    df = pd.DataFrame(data, columns=["kmesh", "TOTEN (eV)"])
+    # --- Plot delta force norm ---
+    plt.figure(figsize=(8, 6))
+    plt.plot(x_ticks, delta_forces, marker="o", linestyle="-")
+    plt.xticks(x_ticks, x_labels)
+    plt.xlabel("K-point mesh (kxkykz)" if mode == "kpoint" else "ENCUT (eV)")
+    plt.ylabel("Delta Force (meV/Å/atom)")
+    plt.title("Convergence: Force")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_dir, f"{output_plot_prefix}_force.png"))
+    plt.close()
+
+    # --- Plot delta virial norm ---
+    plt.figure(figsize=(8, 6))
+    plt.plot(x_ticks, delta_virials, marker="o", linestyle="-")
+    plt.xticks(x_ticks, x_labels)
+    plt.xlabel("K-point mesh (kxkykz)" if mode == "kpoint" else "ENCUT (eV)")
+    plt.ylabel("Delta Virial (meV/atom)")
+    plt.title("Convergence: Virial")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_dir, f"{output_plot_prefix}_virial.png"))
+    plt.close()
+
+    # --- Save CSV ---
+    df = pd.DataFrame({
+        "kmesh_or_energy": x_labels,
+        "Delta TOTEN (meV)": delta_energies,
+        "Delta Force Norm (meV/Å)": delta_forces,
+        "Delta Virial Norm (meV)": delta_virials
+    })
     df.to_csv(os.path.join(base_dir, output_csv), index=False)
 
     if debug:
-        print(f"[INFO] Plot saved to {output_plot}")
-        print(f"[INFO] CSV saved to {output_csv}")
+        print(f"[INFO] Convergence plots and {output_csv} saved in {base_dir}.")
+

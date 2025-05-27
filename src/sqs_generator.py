@@ -2,8 +2,9 @@ import os
 import subprocess
 import numpy as np
 import shutil
+import random
 from pymatgen.io.vasp import Poscar
-from pymatgen.core import Structure
+from pymatgen.core import Structure,Element
 
 
 def ensure_dir(path):
@@ -58,8 +59,8 @@ def generate_rndstr_in(structure, output_path, site_species, vacancy_frac):
         symbol = site.specie.symbol
 
         # Skip third-site vacancies
-        if 2 in site_species and symbol in [el for el, _ in site_species[2]] and i not in kept_third_site_indices:
-            continue
+        #if 2 in site_species and symbol in [el for el, _ in site_species[2]] and i not in kept_third_site_indices:
+        #    continue
 
         dopants = None
         for group_dopants in site_species.values():
@@ -83,7 +84,7 @@ def generate_rndstr_in(structure, output_path, site_species, vacancy_frac):
         f.write("\n".join(lines))
 
 
-def run_corrdump(directory, rndstr_filename="rndstr.in", r2=6.0, r3=5.2, r4=5.2):
+def run_corrdump(directory, rndstr_filename="rndstr.in", r2=4.0, r3=0, r4=0):
     cwd = os.getcwd()
     os.chdir(directory)
     try:
@@ -150,65 +151,6 @@ def clean_directory_keep_poscar(directory):
                 print(f"[WARNING] Failed to remove {full_path}: {e}")
 
 
-def generate_all_poscars(
-    screened_df,
-    unitcell_poscar_path,
-    delta_list,
-    n_atoms,
-    timeout_sec,
-    select_cubic=False,
-    clean_dir=True,
-    output_root="sqs_structures"):
-
-    structure = Poscar.from_file(unitcell_poscar_path).structure
-
-    for _, row in screened_df.iterrows():
-        x, y = float(row['x']), float(row['y'])
-        a_base, a_dop = row['A_base'], row['A_dopant']
-        b_base, b_dop = row['B_base'], row['B_dopant']
-
-        group_dir, comp_dir = build_directory_name(a_base, a_dop, x, b_base, b_dop, y)
-        full_comp_path = os.path.join(output_root, group_dir, comp_dir)
-
-        site_species_ab = {
-            0: [(a_base, 1 - x), (a_dop, x)],
-            1: [(b_base, 1 - y), (b_dop, y)]
-        }
-
-        third_site_elements = detect_third_site_element(structure, site_species_ab)
-        if not third_site_elements:
-            raise ValueError("Unable to infer third site element for vacancy control.")
-        third_element = third_site_elements[0]
-        third_site_indices = [i for i, site in enumerate(structure) if site.specie.symbol == third_element]
-        n_third = len(third_site_indices)
-
-        for delta in delta_list:
-            o_tag = f"o{format_ratio(1 - delta):03d}"
-            full_path = os.path.join(full_comp_path, o_tag)
-            ensure_dir(full_path)
-
-            rndstr_path = os.path.join(full_path, "rndstr.in")
-
-            vacancy_frac = delta / n_third if n_third > 0 else 0.0
-            site_species = site_species_ab.copy()
-            if vacancy_frac > 0:
-                site_species[2] = [(third_element, 1 - vacancy_frac), ("X", vacancy_frac)]
-            else:
-                site_species[2] = [(third_element, 1.0)]
-
-            generate_rndstr_in(structure, rndstr_path, site_species, vacancy_frac)
-            run_corrdump(full_path)
-            run_mcsqs(full_path, n_atoms, timeout_sec)
-            if(select_cubic):
-               replace_sqscell_with_cubic(full_path)
-               run_mcsqs_rc(full_path, timeout_sec)
-            convert_bestsqs_to_poscar(full_path)
-
-            print(f"[INFO] Finished: {full_path}/POSCAR")
-            if(clean_dir):
-               clean_directory_keep_poscar(full_path)
-               print(f"[INFO Clean files in {full_path}]")
-
 
 
 def replace_sqscell_with_cubic(sqscell_dir, tolerance=1e-3):
@@ -274,3 +216,111 @@ def replace_sqscell_with_cubic(sqscell_dir, tolerance=1e-3):
                 f.write('\n')
 
     print(f"Selected {len(selected_raw)} cubic matrices out of {n_matrices}.")
+
+
+
+def generate_random_substitution_poscar(
+    unitcell_poscar_path,
+    site_species,
+    output_path,
+    seed,
+):
+    random.seed(seed)
+    structure = Poscar.from_file(unitcell_poscar_path).structure.copy()
+
+    # --- Perform random substitution ---
+    for site_type, species_frac in site_species.items():
+        base_elem = species_frac[0][0]
+        indices = [i for i, site in enumerate(structure) if site.specie.symbol == base_elem]
+
+        for dopant, frac in species_frac:
+            if dopant == base_elem:
+                continue
+            num_replace = int(round(len(indices) * frac))
+            replace_indices = random.sample(indices, num_replace)
+            for idx in replace_indices:
+                structure.replace(idx, dopant, coords=structure[idx].frac_coords)
+            indices = [i for i in indices if i not in replace_indices]
+
+    # --- Sort species alphabetically ---
+    unique_species = sorted(set(site.specie.symbol for site in structure))
+    ordered_sites = []
+    for symbol in unique_species:
+        ordered_sites.extend([site for site in structure if site.specie.symbol == symbol])
+
+    # --- Create sorted structure and write POSCAR ---
+    sorted_structure = Structure(
+        structure.lattice,
+        [site.species for site in ordered_sites],
+        [site.frac_coords for site in ordered_sites]
+    )
+
+    poscar = Poscar(sorted_structure)
+    poscar.write_file(os.path.join(output_path, "POSCAR"))
+
+def generate_all_poscars(
+    screened_df,
+    unitcell_poscar_path,
+    delta_list,
+    n_atoms,
+    timeout_sec,
+    select_cubic=False,
+    clean_dir=True,
+    output_root="sqs_structures",
+    use_random_substitution=False,
+    seed=123
+):
+    structure = Poscar.from_file(unitcell_poscar_path).structure
+
+    for row_idx, row in screened_df.iterrows():
+        x, y = float(row['x']), float(row['y'])
+        a_base, a_dop = row['A_base'], row['A_dopant']
+        b_base, b_dop = row['B_base'], row['B_dopant']
+
+        group_dir, comp_dir = build_directory_name(a_base, a_dop, x, b_base, b_dop, y)
+        full_comp_path = os.path.join(output_root, group_dir, comp_dir)
+
+        site_species_ab = {
+            0: [(a_base, 1 - x), (a_dop, x)],
+            1: [(b_base, 1 - y), (b_dop, y)]
+        }
+
+        third_site_elements = detect_third_site_element(structure, site_species_ab)
+        if not third_site_elements:
+            raise ValueError("Unable to infer third site element for vacancy control.")
+        third_element = third_site_elements[0]
+
+        for delta_idx, delta in enumerate(delta_list):
+            o_tag = f"o{format_ratio(1 - delta):03d}"
+            full_path = os.path.join(full_comp_path, o_tag)
+            ensure_dir(full_path)
+
+            site_species = site_species_ab.copy()
+            vacancy_frac = delta / 3  # default fallback
+            if vacancy_frac > 0:
+                site_species[2] = [(third_element, 1 - vacancy_frac), ("X", vacancy_frac)]
+            else:
+                site_species[2] = [(third_element, 1.0)]
+
+            if use_random_substitution:
+                # Deterministic sub-seed from global seed, row index, and delta index
+                sub_seed = hash((seed, row_idx, delta_idx)) % (2**32)
+                generate_random_substitution_poscar(
+                    unitcell_poscar_path,
+                    site_species,
+                    full_path,
+                    sub_seed
+                )
+            else:
+                rndstr_path = os.path.join(full_path, "rndstr.in")
+                generate_rndstr_in(structure, rndstr_path, site_species, vacancy_frac)
+                run_corrdump(full_path)
+                run_mcsqs(full_path, n_atoms, timeout_sec)
+                if select_cubic:
+                    replace_sqscell_with_cubic(full_path)
+                    run_mcsqs_rc(full_path, timeout_sec)
+                convert_bestsqs_to_poscar(full_path)
+                if clean_dir:
+                    clean_directory_keep_poscar(full_path)
+
+            print(f"[INFO] Finished: {full_path}/POSCAR")
