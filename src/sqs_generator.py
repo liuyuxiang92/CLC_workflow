@@ -218,7 +218,6 @@ def replace_sqscell_with_cubic(sqscell_dir, tolerance=1e-3):
     print(f"Selected {len(selected_raw)} cubic matrices out of {n_matrices}.")
 
 
-
 def generate_random_substitution_poscar(
     unitcell_poscar_path,
     site_species,
@@ -234,12 +233,16 @@ def generate_random_substitution_poscar(
         indices = [i for i, site in enumerate(structure) if site.specie.symbol == base_elem]
 
         for dopant, frac in species_frac:
+            num_replace = int(round(len(indices) * frac))
             if dopant == base_elem:
                 continue
-            num_replace = int(round(len(indices) * frac))
             replace_indices = random.sample(indices, num_replace)
-            for idx in replace_indices:
-                structure.replace(idx, dopant, coords=structure[idx].frac_coords)
+            if dopant.upper().startswith("X"):  # vacancy: remove atoms
+                for idx in sorted(replace_indices, reverse=True):
+                    del structure[idx]
+            else:
+                for idx in replace_indices:
+                    structure.replace(idx, dopant, coords=structure[idx].frac_coords)
             indices = [i for i in indices if i not in replace_indices]
 
     # --- Sort species alphabetically ---
@@ -257,6 +260,7 @@ def generate_random_substitution_poscar(
 
     poscar = Poscar(sorted_structure)
     poscar.write_file(os.path.join(output_path, "POSCAR"))
+
 
 def generate_all_poscars(
     screened_df,
