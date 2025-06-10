@@ -59,9 +59,10 @@ oxidation_state_bounds = {
 
 #Magmom info
 MAGMOM_VALUES = {
-    "Fe": 6, 
+    "Fe": 5, 
     "Co": 5, 
     "Mn": 5, 
+    "Cr": 5,
     "Ni": 5
 }
 
