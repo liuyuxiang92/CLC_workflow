@@ -104,7 +104,15 @@ def run_mcsqs(directory, n_atoms, timeout_sec):
     cwd = os.getcwd()
     os.chdir(directory)
     try:
-        subprocess.run(["mcsqs", f"-n={n_atoms}"], check=True, timeout=timeout_sec)
+        print("check run_mcsqs")
+        print(f"mcsqs -n={n_atoms}")
+        if isinstance(n_atoms, (tuple, list)):
+            n_atoms = n_atoms[0]
+        else:
+            n_atoms = int(n_atoms)
+        print(f"mcsqs -n={n_atoms}")
+        subprocess.run(["mcsqs", f"-n={n_atoms}"], check=True, timeout=timeout_sec,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print("after run_mcsqs")
     except subprocess.TimeoutExpired:
         print(f"[TIMEOUT] mcsqs timed out in {directory} after {timeout_sec} seconds.")
     except subprocess.CalledProcessError as e:
@@ -199,8 +207,9 @@ def replace_sqscell_with_cubic(sqscell_dir, tolerance=1e-3):
 
     selected_raw = []
     for raw, mat in zip(matrices_raw, matrices_float):
-        lengths = np.linalg.norm(mat, axis=1)
-        if np.all(np.abs(lengths - lengths[0]) < tolerance):
+#        lengths = np.linalg.norm(mat, axis=1)
+#        if np.all(np.abs(lengths - lengths[0]) < tolerance):
+            lengths = np.linalg.norm(mat, axis=1)
             cos01 = np.dot(mat[0], mat[1]) / (lengths[0] * lengths[1])
             cos02 = np.dot(mat[0], mat[2]) / (lengths[0] * lengths[2])
             cos12 = np.dot(mat[1], mat[2]) / (lengths[1] * lengths[2])
@@ -317,14 +326,57 @@ def generate_all_poscars(
                 )
             else:
                 rndstr_path = os.path.join(full_path, "rndstr.in")
+                print(f"site_species = {site_species}")
                 generate_rndstr_in(structure, rndstr_path, site_species, vacancy_frac)
                 run_corrdump(full_path)
                 run_mcsqs(full_path, n_atoms, timeout_sec)
                 if select_cubic:
                     replace_sqscell_with_cubic(full_path)
+                    print("what happen")
                     run_mcsqs_rc(full_path, timeout_sec)
                 convert_bestsqs_to_poscar(full_path)
                 if clean_dir:
                     clean_directory_keep_poscar(full_path)
 
             print(f"[INFO] Finished: {full_path}/POSCAR")
+
+
+
+#generate rndstr.in for oxygen vacancy
+def generate_rndstr_in_oxygen_vacancy(poscar_path: str, output_path: str = "rndstr.in", oxygen_fraction: float = 0.9):
+    """
+    Generate a rndstr.in file for MCSQS with fixed A/B cations and mixed O/Va sites.
+
+    Args:
+        poscar_path (str): Path to the POSCAR file.
+        output_path (str): Output path for rndstr.in.
+        oxygen_fraction (float): Fraction of O atoms to keep (e.g., 0.9 for 10% vacancy).
+    """
+    structure = Structure.from_file(poscar_path)
+    lattice = structure.lattice
+    lines = []
+
+    lengths = np.array(lattice.lengths)
+    angles = lattice.angles
+    lines.append(f"{lengths[0]:.6f} {lengths[1]:.6f} {lengths[2]:.6f} {angles[0]:.2f} {angles[1]:.2f} {angles[2]:.2f}")
+
+    unit_vectors = np.array(lattice.matrix) / lengths[:, np.newaxis]
+    for vec in unit_vectors:
+        lines.append(" ".join(f"{x:.6f}" for x in vec))
+
+    for i, site in enumerate(structure):
+        el = site.specie.symbol
+        frac = site.frac_coords
+
+        if el == "O":
+            dop_str = f"O={oxygen_fraction:.6f}, Va={1.0 - oxygen_fraction:.6f}"
+        else:
+            dop_str = f"{el}=1.000000"
+
+        lines.append(f"{frac[0]:.6f} {frac[1]:.6f} {frac[2]:.6f} {dop_str}")
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+    print(f"[INFO] Successfully wrote {output_path} with O/Va mixing (O fraction = {oxygen_fraction})")
+
