@@ -3,6 +3,7 @@ import subprocess
 import numpy as np
 import shutil
 import random
+import secrets
 from pymatgen.io.vasp import Poscar
 from pymatgen.core import Structure,Element
 
@@ -84,7 +85,7 @@ def generate_rndstr_in(structure, output_path, site_species, vacancy_frac):
         f.write("\n".join(lines))
 
 
-def run_corrdump(directory, rndstr_filename="rndstr.in", r2=4.0, r3=0, r4=0):
+def run_corrdump(directory, rndstr_filename="rndstr.in", r2=5.58, r3=4.24, r4=0):
     cwd = os.getcwd()
     os.chdir(directory)
     try:
@@ -111,7 +112,12 @@ def run_mcsqs(directory, n_atoms, timeout_sec):
         else:
             n_atoms = int(n_atoms)
         print(f"mcsqs -n={n_atoms}")
-        subprocess.run(["mcsqs", f"-n={n_atoms}"], check=True, timeout=timeout_sec,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"timeout_sec = {timeout_sec}")
+
+        # simple, secure, built-in seed: 1..(2**31-1)
+        random_seed = 1 + secrets.randbelow(2**31 - 1)
+
+        subprocess.run(["mcsqs", f"-n={n_atoms}", "-sd={random_seed}"], check=True, timeout=timeout_sec,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print("after run_mcsqs")
     except subprocess.TimeoutExpired:
         print(f"[TIMEOUT] mcsqs timed out in {directory} after {timeout_sec} seconds.")
