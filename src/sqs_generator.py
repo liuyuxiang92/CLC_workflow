@@ -117,7 +117,7 @@ def run_mcsqs(directory, n_atoms, timeout_sec):
         # simple, secure, built-in seed: 1..(2**31-1)
         random_seed = 1 + secrets.randbelow(2**31 - 1)
 
-        subprocess.run(["mcsqs", f"-n={n_atoms}", "-sd={random_seed}"], check=True, timeout=timeout_sec,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["mcsqs", f"-n={n_atoms}", f"-sd={random_seed}"], check=True, timeout=timeout_sec,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print("after run_mcsqs")
     except subprocess.TimeoutExpired:
         print(f"[TIMEOUT] mcsqs timed out in {directory} after {timeout_sec} seconds.")
