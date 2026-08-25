@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clc-workflow"
+version = "0.2"
+description = "Screening workflow for perovskites applied in chemical looping beyond combustion"
+requires-python = ">=3.9"
+authors = [{ name = "Yuxiang Liu" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyyaml",
+    "pymatgen",
+]
+
+[project.optional-dependencies]
+# Kept out of the base install so `clc status` and `clc submit` work in a slim
+# environment.  The submitting machine needs dpdispatcher; the plotting is usually done
+# somewhere else entirely.
+submit = ["dpdispatcher"]
+plot = ["matplotlib", "scipy"]
+analysis = ["phonopy", "ase", "openpyxl"]
+all = ["dpdispatcher", "matplotlib", "scipy", "phonopy", "ase", "openpyxl"]
+
+[project.scripts]
+clc = "clc_workflow.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The node-side workers, the `clc init` templates and run_all.sh travel with the install
+# so that a case directory needs no code of its own.
+clc_workflow = ["workers/*.py", "templates/*.yaml", "templates/*.json", "run_all.sh"]

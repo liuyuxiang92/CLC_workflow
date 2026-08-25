@@ -1,0 +1,5 @@
+{
+    "group_size": 1,
+    "local_root": "./",
+    "source_list": ["/root/dp-outisli-env/bin/activate"]
+}

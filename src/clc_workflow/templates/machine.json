@@ -1,0 +1,29 @@
+{
+    "_comment": [
+        "Bohrium credentials.  THIS FILE IS A TEMPLATE AND IS COMMITTED -- fill the",
+        "placeholders in the copy `clc init` writes into your case directory, never here.",
+        "",
+        "Better: put a filled-in machine.json at ~/.clc/machine.json and `clc init` will",
+        "copy that instead of this placeholder, so the credential lives in exactly one",
+        "place off the repo and no case directory ever starts with a blank one."
+    ],
+    "batch_type": "Bohrium",
+    "context_type": "BohriumContext",
+    "local_root": "./",
+    "remote_profile": {
+        "email": "YOUR_BOHRIUM_EMAIL",
+        "password": "YOUR_BOHRIUM_PASSWORD",
+        "program_id": 0,
+        "keep_backup": false,
+        "input_data": {
+            "job_type": "container",
+            "log_file": "tmp_log",
+            "grouped": true,
+            "job_name": "clc",
+            "disk_size": 100,
+            "machine_type": "c12_m92_1 * NVIDIA V100",
+            "image_name": "registry.dp.tech/dptech/dp/native/prod-435364/dpa3-phonopy-mcsqs-clc:0.0.0",
+            "on_demand": 0
+        }
+    }
+}

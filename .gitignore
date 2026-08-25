@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.claude/state/
+
+# personal credentials never belong here; the packaged machine.json is a placeholder
+machine_personal.json
+.clc/

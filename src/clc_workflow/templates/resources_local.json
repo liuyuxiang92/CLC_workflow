@@ -1,0 +1,8 @@
+{
+    "number_node": 1,
+    "cpu_per_node": 4,
+    "gpu_per_node": 1,
+    "queue_name": "shell",
+    "group_size": 1000,
+    "local_root": "./"
+}

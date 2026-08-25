@@ -1,7 +1,0 @@
-Metadata-Version: 2.1
-Name: perovskite_screening
-Version: 0.1
-Summary: Compositional screening workflow for perovskites
-Author: Yuxiang Liu
-Requires-Dist: numpy
-Requires-Dist: pandas
