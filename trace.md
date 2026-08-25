@@ -429,3 +429,21 @@ composition mcsqs cannot handle.
   (from `model_store` / `$CLC_MODEL_DIR` / `~/.clc/models`) into `output_root`, copying
   only across filesystems. Verified same inode, 2 links. Side benefit the manual copy
   never had: the node always runs the *installed* worker.
+
+### EARS — Commit Digest: package-and-cli (2026-08-25)
+<!-- concepts: secret-hygiene, python-packaging, git-hygiene -->
+- **Near-miss worth remembering**: `clc init` needed a `machine.json` template, and the
+  obvious way to make one was to copy the working `structures/machine.json` into
+  `templates/`. That file holds live Bohrium email+password, and `templates/` is inside a
+  git repo with a GitHub remote. Caught only because a push was requested and secrets were
+  scanned before staging. **Copying a working config into a template directory moves a
+  secret across a trust boundary** — the file is unchanged, but who can read it is not.
+- History was clean (`git rev-list --all` + `git grep` for the password and email found
+  nothing), so no rewrite was needed — the credential had never been committed.
+- Resolution: packaged template carries placeholders; `clc init` prefers a filled-in
+  `~/.clc/machine.json` (mode 600) when present and says which source it used. Convenience
+  kept, secret off the repo, exactly one copy of it.
+- Also untracked `src/*.egg-info/` — tracked from before `.gitignore` existed, so the
+  ignore rule never applied and they showed as modified noise on every install.
+- Pushed as a branch rather than straight to `main` (all prior history is direct-to-main);
+  80 files, +10062/-530.
