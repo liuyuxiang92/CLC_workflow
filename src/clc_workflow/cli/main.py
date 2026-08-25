@@ -34,6 +34,8 @@ COMMANDS = {
     "status":   ("status",              "what is done and what is pending across the tree"),
     "check-bob":("check_bob",           "stage 6.5 -- B-O-B distribution report"),
     "delta":    ("build_delta_dataset", "build the measured-vs-computed delta dataset"),
+    "config-from-xlsx": ("config_from_xlsx",
+                         "derive a families: block from a measurement spreadsheet"),
     "convergence": ("convergence_x0",   "convergence analysis at x0"),
     "compare":  ("compare_exp_theory",  "compare experiment against theory"),
 }
