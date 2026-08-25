@@ -78,11 +78,13 @@ def main(argv=None):
         stores = ", ".join(str(d) for d in model_store_dirs(cfg)) or "none configured"
         print(f"[WARNING] {md['model_path']} was not found next to {args.config}, in")
         print(f"          {root}, or in the model store ({stores}),")
-        print(f"          so the deck names it relative to each task directory -- where")
-        print(f"          nothing puts it, and LAMMPS will fail with 'Cannot open file'.")
-        print(f"          Either put it beside the config or in a model_store directory,")
-        print(f"          or set md.model_path to its absolute path on the node, then")
-        print(f"          rerun with --force.")
+        print(f"          The deck is still written as {model_in_deck}, which is where a")
+        print(f"          model uploaded with the submission lands -- so the DECK is right")
+        print(f"          and nothing here needs rerunning.  What is missing is the upload:")
+        print(f"          put the file beside the config or in a model_store directory")
+        print(f"          before `clc submit md`, and it ships as a common file.")
+        print(f"          (Or set md.model_path to its absolute path on the node and rerun")
+        print(f"          with --force.)")
 
     head = md.get("model_head")
     # A training checkpoint is not a frozen model; pair_style deepmd will fail to load it

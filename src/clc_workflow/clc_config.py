@@ -64,7 +64,24 @@ def stage_model(cfg, stage):
                 f"dpdispatcher can only upload files under the work base, so copy it "
                 f"into {root} or give its absolute path on the compute node instead.")
         return f"{REL_PREFIX}/{rel}", rel
-    return model, None
+
+    # Not here YET.  It is still a relative path, and a relative model can only ever be
+    # at the work base on the node: the o#### directory is created fresh and receives
+    # nothing but forward_files.  So reference it through REL_PREFIX anyway.  Writing the
+    # bare name instead -- which this used to do -- bakes "compressed_model.pt2" into
+    # input.lammps, and that is not a path that becomes correct later; it is one that
+    # fails with "Cannot open file" on the node no matter what turns up at output_root.
+    #
+    # This matters because the deck is written at stage 2 and the model is staged at
+    # submission, which can be days apart: a checkpoint that arrives from the model store
+    # in between used to leave a deck that had already been baked wrong.  Nothing is
+    # staged (second element stays None), so the caller still warns about the upload.
+    norm = os.path.normpath(model)
+    if norm.startswith(os.pardir):
+        # Escapes output_root, so no prefix can make it reachable -- and dpdispatcher
+        # could not upload it either.  Pass it through and let the caller complain.
+        return model, None
+    return f"{REL_PREFIX}/{norm}", None
 
 # Keys config.yaml may set to override machine.json / resources.json, and where each
 # one lands in that JSON.  Overrides are applied to an in-memory copy at submit time --

@@ -198,9 +198,9 @@ def main(argv=None):
             # that only surfaces after the queue wait, so say so before submitting.
             model_warning = (
                 f"model {model!r} will not exist on the compute node.\n"
-                f"    It is a relative path, so it is looked up in each task's o#### "
-                f"directory,\n"
-                f"    which is created fresh and receives only {fwd}.\n"
+                f"    The command references it at the work base, which is right -- but "
+                f"nothing\n"
+                f"    is uploading it there, so the task will not find it.\n"
                 f"    It was looked for next to {args.config}, in "
                 f"{cfg['output_root']}, and in the model store\n"
                 f"    ({', '.join(str(d) for d in model_store_dirs(cfg)) or 'no store configured'}), "
