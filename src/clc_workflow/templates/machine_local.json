@@ -1,0 +1,6 @@
+{
+    "batch_type": "Shell",
+    "context_type": "LocalContext",
+    "local_root": "./",
+    "remote_root": "/tmp/clc_local_run"
+}

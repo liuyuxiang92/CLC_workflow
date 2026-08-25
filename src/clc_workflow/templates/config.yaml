@@ -1,0 +1,271 @@
+# =====================================================================================
+#  One config for the whole pipeline.
+#
+#  Everything at once, unattended:
+#       ./run_all.sh config.yaml                 (add --dry-run for a rehearsal)
+#
+#  Or stage by stage:
+#    1  python gen_sqs.py         config.yaml [--dry-run]     -> POSCAR + manifest.csv
+#    2  python gen_md.py          config.yaml                 -> conf.lmp, input.lammps
+#    3  python submit.py md       config.yaml [--dry-run]     -> traj.lammpstrj
+#    4  python collect_md.py      config.yaml                 -> POSCAR_md_avg
+#    5  python submit.py opt      config.yaml                 -> opt.traj, opt_result.json
+#    6  python collect_opt.py     config.yaml                 -> optimized_POSCAR
+#  6.5  python check_bob.py       config.yaml [--plot]        -> bob_summary.csv  (optional)
+#    7  python submit.py phonon   config.yaml                 -> energy.txt, *.yaml, stability.txt
+#    8  python collect_results.py config.yaml                 -> results.csv, results_avg.csv
+#    9  python plot_heatmap_avg_series_bolz_linear.py --parent . --series-glob 'set_*'
+#                                                             -> dG0_vacancy_summary.csv
+#
+#  Progress at any time:  python status.py config.yaml
+# =====================================================================================
+
+base_poscar: ./POSCAR          # 2x2x2 cubic perovskite, 40 sites (8 Sr / 8 Fe / 24 O)
+output_root: .                 # set_01/, set_02/, ... and manifest.csv land here
+# Independent realisations.  Raising this later only ADDS sets: names come from
+# f"{prefix}_{i:02d}", which pads to AT LEAST two digits, so 50 -> 100 keeps set_01..set_50
+# byte-identical and appends set_51..set_100.  Existing structures are skipped
+# (sqs.skip_existing), so a rerun costs nothing for the sets already built.
+# Do NOT "fix" the padding to 3 digits: that renames every directory and rebuilds the tree.
+n_sets: 100
+set_prefix: set
+
+# ---- defaults shared by every family (a family may override any of these) ----
+a_base: Sr
+b_base: Fe
+x_values: [0.750]
+y_values: [0.375]
+vacancies: {n_min: 0, n_max: 32}       # oxygen vacancies per supercell, inclusive
+screen_charge_neutrality: true
+screening_delta_range: [0.0, 0.5]
+
+# ---- the families to generate.  Sr(1-x) X(x) Fe(1-y) Y(y) O(3-delta) ----
+# Charge neutrality prunes each family differently, so run --dry-run to see the real
+# structure count before committing GPU hours.  Measured on the 9x9 grid:
+#   Ca/Mn 81   Sm/Mo 81   Ba/Co 72   Ce/Cr 72   K/Ti 36   La/Ni 36   Y/Mg 18
+families:
+  - {a_dopant: Ca, b_dopant: Co}
+# - {a_dopant: Ba, b_dopant: Co}
+# - {a_dopant: La, b_dopant: Ni, vacancies: {n_min: 0, n_max: 16},
+#    y_values: [0.0, 0.250, 0.500]}        # per-family override
+
+sqs:
+  # "mcsqs"  correlation-optimised SQS via ATAT.
+  # "random" plain random occupation -- no ATAT, milliseconds per structure, and the
+  #          oxygen vacancies of one composition are NESTED: o969 is o984 with one more
+  #          oxygen removed, o953 is o969 with one more, down to the last.
+  #
+  # Why random is set here.  Stage 9's dG per vacancy is a DIFFERENCE between adjacent
+  # o* directories.  With independently generated cells that difference carries the
+  # arrangement noise of two unrelated structures -- several eV at high delta, which is
+  # the same size as the vacancy formation energy it is supposed to measure.  Along one
+  # removal path most of it cancels.  Switch back with one word if you want ATAT.
+  method: random
+  # Shifts the whole random ensemble.  The per-structure seed is
+  # sha256(random_seed | set/group/comp) -- note nv is NOT in the key, which is exactly
+  # what nests the vacancy series.  Leave it alone and a rerun reproduces the tree.
+  random_seed: 0
+
+  supercell: [2, 2, 2]                 # of the 40-site base cell -> 320 sites, 192 O
+  clean_dir: true                      # keep only POSCAR in each o* dir
+  skip_existing: true                  # makes reruns resumable
+  n_procs: 8
+
+  # ---- mcsqs only; ignored entirely when method is random ------------------------
+  cutoffs: {r2: 5.58, r3: 4.24, r4: 0}
+  # A 10 s budget does not let mcsqs converge a 320-site cell -- it keeps the best
+  # correlation found so far, which at 10 s is close to random anyway, only without the
+  # nesting.  If you go back to mcsqs, raise this to ~240 s; if 10 s was chosen to make
+  # 3300 structures tractable, method: random is the better answer to that problem.
+  timeout_sec: 10
+  pin_cpus: false                      # Linux-only CPU pinning; no-op elsewhere
+
+md:
+  # A frozen model (.pth / .pb / .pt2), NOT a checkpoint.  If the file sits beside this
+  # config, gen_md.py writes ../../../../<name> into input.lammps and submit.py uploads it
+  # once per submission; give an absolute path instead if it already lives on the node.
+  # Either way the two agree, because both call clc_config.stage_model.
+  model_path: compressed_model.pt2
+  # null = the MD model is single-task, so there is no head to record.  That is the
+  # case here: model.pth was frozen without --head, unlike the opt/phonon checkpoint
+  # below, which is multi-task and needs model_head to pick a branch.
+  #
+  # If you ever swap in a model frozen from a multi-task checkpoint, put its head name
+  # here.  It is NOT passed to pair_style -- deepmd-kit 3.x has no head keyword there,
+  # so the head has to be baked in at freeze time:
+  #     dp --pt freeze -c model.ckpt.pt -o model.pth --head DOWNSTREAM_DATA
+  # The field only records which branch the file came from (written into input.lammps
+  # as a comment); gen_md.py prints the matching freeze command.
+  model_head: null
+
+  # ---- what the LAMMPS build provides (not what the run should do) ----------------
+  # The dpa4C build at $LMP has the pair style compiled in and is launched under Kokkos
+  # (-k on g 1 -sf kk), so the deck asks for the /kk variant directly and there is no
+  # plugin to load -- `plugin load` on this build is a hard error, not a warning.
+  # For a stock deepmd-kit LAMMPS instead:  deepmd / atomic / libdeepmd_lmp.so
+  pair_style: dpa4spin/kk
+  atom_style: atomic                   # see the note in dispatch.md below
+  plugin: null
+
+  temperature_k: 300
+  run_ps: 200                          # -> 100000 steps at 0.002 ps
+  timestep_ps: 0.002
+  thermo_freq: 10
+  dump_freq: 100
+  pressure_bar: 0.0
+  tau_t: 0.1
+  tau_p: 0.5
+  velocity_seed: auto                  # 'auto' = deterministic per structure
+
+  # ---- stage 4: what collect_md.py hands the optimiser ----------------------------
+  # POSCAR_md_avg is the structure obtained by averaging atomic positions (and the NPT
+  # cell) over the LAST average_last_ps of the trajectory -- not the last frame.  A single
+  # snapshot catches every atom at a random phase of its libration; averaging leaves only
+  # the static distortion.  At dump_freq 100 / timestep 0.002 ps, 20 ps is ~100 frames.
+  # Set to 0 to go back to writing the last frame.
+  average_last_ps: 20
+  # An atom whose RMS spread about its own mean exceeds this (A) changed sites during the
+  # window -- vacancy-mediated O diffusion -- and its mean would be a point on no site at
+  # all, so it keeps its last-frame position instead.  Vibration is ~0.1 A, a hop >= ~1 A.
+  # Expect zero of these at 300 K; they appear as T and delta rise.  null disables it.
+  avg_rms_max: 0.5
+
+opt:
+  # dpa4.ckpt.pt (descriptor dpa4, fitting dpa4_ener), NOT dpa4c.ckpt.pt, which is a
+  # different model trained with the dpa4c descriptor and produces
+  #     RuntimeError: Unknown descriptor type: dpa4c
+  # on an image whose deepmd-kit does not register it.  The two sit side by side here and
+  # differ by one character, so check this line before blaming the environment.
+  model_path: dpa4.ckpt.pt             # sits beside this config; submit.py stages it
+  # Both checkpoints are multi-task with heads 'opencsp' and 'perovskite' (read from
+  # _extra_state.model_params.model_dict).  It was DOWNSTREAM_DATA, which is in neither.
+  model_head: perovskite
+  fmax: 0.01                          # relaxed from the legacy 0.0005
+  pressure_gpa: 0
+  nsteps: 2000
+  traj_interval: 5
+
+phonon:
+  model_path: dpa4.ckpt.pt             # see the note under opt.model_path
+  model_head: perovskite
+  supercell_matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  displacement: 0.01
+  mesh: [20, 20, 20]
+  temperatures: {start: 670.0, stop: 1070.0, num: 5}
+  delete_band_yaml_after_stability: true   # band.yaml is ~960 bands/q-point at 320 atoms
+
+# ---- WHO READS WHAT IN HERE --------------------------------------------------------
+# Only `temps` and `s_config_a` are read by stage 8 (collect_results.py).
+# `avg_mode`, `mu_G` and `mu_H` are read by NOTHING: stage 9 is a standalone script that
+# takes them as command-line flags, so editing them here changes no result.  The values
+# below are the plot script's own defaults, so today the two agree -- if you change one,
+# change the other, or the two stages will silently disagree about the same quantity:
+#
+#   python plot_heatmap_avg_series_bolz_linear.py --parent . --series-glob 'set_*' \
+#          --temps 670,1070 --s-config-a 2.0 --avg-mode simple \
+#          --mu-g 670:-5.1768,1070:-5.6699 --mu-h 670:-4.37519,1070:-4.304685
+#
+# s_config_a is the MAGNITUDE |a|; the sign is fixed to negative internally, so
+# S_config >= 0 and the reported branch is a = -2.  Pass --sign-compare --full-csv to
+# stage 9 to see a<0 / a>0 / a=0 side by side.
+analysis:
+  avg_mode: simple                     # stage 9 CLI: --avg-mode ('boltz' collapses onto the lowest-G set)
+  temps: [670, 1070]                   # stage 8 reads this
+  s_config_a: 2.0                      # stage 8 reads this; |a|, sign fixed internally
+  mu_G: {670: -5.1768, 1070: -5.6699}      # stage 9 CLI: --mu-g   (per 1/2 O2)
+  mu_H: {670: -4.37519, 1070: -4.304685}   # stage 9 CLI: --mu-h   (only with --with-EH)
+
+dispatch:
+  machine_json: machine.json           # Bohrium credentials + batch/context type
+  resources_json: resources.json       # only the base values; overridden below
+
+  # ---- machine_type / image_name / group_size, editable per stage ----------------
+  # These are applied to an in-memory copy of the two JSONs at submit time; the files
+  # are never rewritten, so the password stays in exactly one place.
+  #   precedence:  dispatch.<stage>.<key>  >  dispatch.<key>  >  the JSON's own value
+  # Values here are the fallback for a stage that does not set its own; all three stages
+  # DO set image_name and machine_type below, because md needs a LAMMPS image while
+  # opt/phonon need ASE + phonopy.  Also per-stage: job_name, disk_size, on_demand,
+  # platform, module_list, envs, source_list.
+  # Check before spending GPU hours:  python submit.py <stage> config.yaml --dry-run
+  machine_type: "c12_m92_1 * NVIDIA V100"
+  image_name: registry.dp.tech/dptech/dp/native/prod-591/dpa4-spin-lmp:9.0
+  # Tasks per Bohrium job.  A group runs its tasks SEQUENTIALLY in one job, so 5 x 200 ps
+  # of NPT has to fit the wall-time limit -- check the first group's log before scaling up.
+  group_size: 5
+
+  # ...unless para_deg says otherwise: it is how many of a group's tasks run AT THE SAME
+  # TIME on the node, so wall time per job is ceil(group_size / para_deg) x per-task.
+  # A 320-atom DP job does not saturate a V100, so 2-4 concurrent tasks is mostly free
+  # throughput; the limit is GPU memory, since each one loads its own copy of the model.
+  # Settable per stage.  Leave phonon at 1.  See config_feco.yaml for a worked example.
+  para_deg: 1
+
+  # NOTE: source_list is per stage, not here.  It names a path INSIDE the image, so it is
+  # only correct for the image the stage actually runs on -- a stale one is what produced
+  # "/opt/intel/oneapi/setvars.sh: No such file or directory" in every job.
+
+  md:
+    # LAMMPS image: the dpa4C spin build + the deepmd C++ library it links against.
+    machine_type: "c12_m92_1 * NVIDIA V100"
+    image_name: registry.dp.tech/dptech/dp/native/prod-591/dpa4-spin-lmp:9.0
+    source_list: [/root/dp-outisli-env/bin/activate]
+    # The dpa4C LAMMPS is a build under /root, not something on PATH, so it is invoked by
+    # absolute path.  -k on g 1 = Kokkos on one GPU; -sf kk appends /kk to styles that
+    # have a Kokkos variant, which is why md.pair_style above already says dpa4spin/kk.
+    # NOTE: the deck this pipeline writes is input.lammps, not the in.default of the
+    # hand-run examples -- gen_md.py names one per structure, so -in must match.
+    command: "$LMP -k on g 1 -sf kk -in input.lammps > log.lammps"
+    envs:
+      LMP: /root/dpa4C-lammps/lammps/lammps-patch_4Jul2026-newtonian-spin/build/lmp
+      # The pair style is linked against the C++ deepmd in this prefix, not the one the
+      # image's python package carries.
+      LD_LIBRARY_PATH: /root/deepmd-kit-outisli-cpp/lib:$LD_LIBRARY_PATH
+    job_name: clc_md
+    # 100 tasks per job = 100 x 200 ps of 320-atom NPT back to back, at para_deg 1.  That
+    # is a long wall time for one job: check the first group's log.lammps for the step it
+    # reached before scaling the rest.  A truncated traj.lammpstrj still comes back and
+    # collect_md.py takes its last complete frame, so an over-long group degrades quietly
+    # rather than erroring -- which is exactly why it is worth checking rather than
+    # assuming.  Raising para_deg to 2-4 divides the wall time by that factor.
+    group_size: 100
+    forward_files: [conf.lmp, input.lammps]
+    backward_files: [log.lammps, traj.lammpstrj]
+    # The model is added here automatically when it sits beside this config; see
+    # md.model_path above.  Only list it by hand to override that.
+    forward_common_files: []
+  opt:
+    # dp_opt.py needs ase + deepmd.calculator, not LAMMPS -- but it must be a deepmd-kit
+    # that KNOWS the dpa4c descriptor.  The dpa3 image's /root/Software/deepmd-kit does
+    # not: it fails at model load with
+    #     RuntimeError: Unknown descriptor type: dpa4c. Did you mean: dpa3?
+    # The dpa4c support lives in the outisli build, which is why source_list activates
+    # the same venv md uses.  Keep image_name and source_list in step -- the venv path is
+    # only meaningful inside this image.
+    machine_type: "c12_m92_1 * NVIDIA V100"
+    image_name:  registry.dp.tech/dptech/dp/native/prod-435364/dpa4-phonopy:0.0.4
+    source_list: []
+    job_name: clc_opt
+    # Cheapest stage (minutes per structure), so queue wait dominates -- this is the
+    # one where a group_size well above the global 5 pays off most.
+    # group_size: 20
+    forward_files: [POSCAR_md_avg]
+    backward_files: [opt.traj, opt_result.json]
+    forward_common_files: [dp_opt.py]
+  phonon:
+    # Same deepmd-kit constraint as opt, plus phonopy.  If phonopy is missing from this
+    # image the fix is `pip install phonopy` prepended to the command below, NOT going
+    # back to the dpa3 image -- that one cannot load a dpa4c model at all.
+    machine_type: "c12_m92_1 * NVIDIA V100"
+    image_name: registry.dp.tech/dptech/dp/native/prod-435364/dpa4-phonopy:0.0.4
+    source_list: []
+    job_name: clc_phonon
+    # Most expensive stage: finite displacements on 320 atoms.  100 of them sequentially
+    # in one job is a lot -- this is the group_size most likely to hit the wall-time
+    # limit, and a phonon task that dies mid-run leaves no stability.txt, so the
+    # structure simply drops out of the average (stages 8/9 report it as a thin set).
+    group_size: 100
+    # machine_type: "c32_m128_1 * NVIDIA V100"
+    forward_files: [optimized_POSCAR]
+    backward_files: [energy.txt, thermal_properties.yaml, stability.txt]
+    forward_common_files: [dp_phonon.py]

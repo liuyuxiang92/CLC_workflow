@@ -1,6 +1,0 @@
-setup.py
-src/perovskite_screening.egg-info/PKG-INFO
-src/perovskite_screening.egg-info/SOURCES.txt
-src/perovskite_screening.egg-info/dependency_links.txt
-src/perovskite_screening.egg-info/requires.txt
-src/perovskite_screening.egg-info/top_level.txt

@@ -1,0 +1,376 @@
+# =====================================================================================
+#  Sr(A)Fe(Co)O3 target list -- all three lists, one supercell, delta = 0.
+#
+#    1  python gen_sqs.py         config_feco.yaml [--dry-run]  -> POSCAR + manifest.csv
+#    2  python gen_md.py          config_feco.yaml              -> conf.lmp, input.lammps
+#    3  python submit.py md       config_feco.yaml [--dry-run]  -> traj.lammpstrj
+#    4  python collect_md.py      config_feco.yaml              -> POSCAR_md_avg
+#    5  python submit.py opt      config_feco.yaml              -> opt.traj, opt_result.json
+#    6  python collect_opt.py     config_feco.yaml              -> optimized_POSCAR
+#  6.5  python check_bob.py       config_feco.yaml [--plot]     -> bob_summary.csv
+#    7  python submit.py phonon   config_feco.yaml              -> energy.txt, *.yaml
+#    8  python collect_results.py config_feco.yaml              -> results.csv, results_avg.csv
+#
+#  Progress at any time:  python status.py config_feco.yaml
+#
+#  ---- THE FOUR THINGS THAT DIFFER FROM config.yaml ---------------------------------
+#
+#  1. NO OXYGEN VACANCIES.  vacancies n_min = n_max = 0: every structure is the
+#     stoichiometric delta = 0 end member, in a single o1000/ directory.  Stage 8 then has
+#     one delta point per composition -- enough for E(composition), NOT for a dG(T, pO2)
+#     curve, which needs delta > 0 rows.
+#
+#  2. NO CHARGE-NEUTRALITY SCREEN.  The screen prunes a 9x9 GRID down to what can balance
+#     somewhere in delta = 0..0.5.  Here the compositions are a given list, and at delta
+#     fixed to 0 the screen would drop rows that were asked for.
+#
+#  3. A 5-ATOM BASE CELL AND A 400-ATOM SUPERCELL.  List 3 is off-stoichiometric in steps
+#     of 0.05, and (Sr0.75Ba0.25)0.95 needs steps of 0.0125 -> the A sublattice must hold
+#     80 sites for those to be whole atoms.  From the 40-site ./POSCAR (8 A per cell) 80 A
+#     sites is [5,2,1] = 38.6 x 15.4 x 7.7 A, whose short axis is BELOW the 5.58 A pair
+#     cutoff corrdump is given -- the cluster expansion would then wrap onto its own
+#     image.  From ./POSCAR_prim (1 A per cell) the same 400 atoms is [5,4,4] =
+#     19.3 x 15.4 x 15.4 A, every axis comfortably above the cutoff.  Lists 1 and 2 use
+#     the same cell so that finite-size error is common to all three and the energies are
+#     directly comparable.
+#
+#  4. COMPOSITIONS ARE A LIST, NOT A GRID.  A family block is one x_values * y_values
+#     cross product at one (a_vac, b_vac), so the list is expressed as several blocks.
+#     Every block below is exactly the requested compounds -- none generates a
+#     composition that was not asked for.  Adding a value to a block adds its whole row,
+#     so add a new block instead.
+#
+#  Compositions: 26 stoichiometric (lists 1+2) + 15 off-stoichiometric (list 3) = 41,
+#  x 3 sets = 123 structures of 400 atoms.  That is 1.6x the per-structure MD cost of the
+#  320-atom config.yaml runs; check the first group's log.lammps before scaling group_size.
+#  Count them first:  python gen_sqs.py config_feco.yaml --dry-run
+# =====================================================================================
+
+base_poscar: ./POSCAR_prim     # 5-atom cubic perovskite, a = 3.851 A (1 Sr / 1 Fe / 3 O)
+output_root: .                 # set_01/, set_02/, ... and manifest.csv land here
+n_sets: 50                      # independent SQS realisations (fresh mcsqs seed each)
+set_prefix: set
+
+a_base: Sr
+b_base: Fe
+
+# delta = 0 only.  nv_range() returns [0], so each composition gets one o1000/ directory.
+vacancies: {n_min: 0, n_max: 0}
+
+# Off, for the reason in the header.  The list is the specification.
+screen_charge_neutrality: false
+
+# Set per block below; empty here so a block that forgets one fails loudly instead of
+# silently inheriting the 9-point default grid.
+x_values: []
+y_values: []
+
+# =====================================================================================
+#  HOW THE OFF-STOICHIOMETRIC ROWS ARE ENCODED
+#
+#  x and y are fractions of the A and B SITES, and a_vac / b_vac are the vacancy
+#  fractions of those same sites, so the base species gets 1 - x - a_vac.  A formula maps
+#  onto that directly:
+#
+#      Sr0.75 Ca0.2 Fe0.875 Co0.125 O3      (A total 0.95, so 5% of the A sites are empty)
+#      ->  x: 0.2   a_vac: 0.05   y: 0.125   b_vac: 0      (Sr = 1 - 0.2 - 0.05 = 0.75)
+#
+#  On the 80 A / 80 B sites of this supercell that is 60 Sr + 16 Ca + 4 vacancies, and
+#  70 Fe + 10 Co.  gen_sqs checks every one of these lands on a whole site and refuses to
+#  run if it does not -- mcsqs is handed concentrations, not counts, so an unrealisable
+#  composition would be rounded silently into a compound nobody asked for.
+#
+#  A/B > 1 IS A B-SITE VACANCY.  Sr0.75Ca0.3FeO3-like rows have 1.05 A per B, which no
+#  lattice can hold on a full A sublattice; the perovskite way to write it is A1 B(1/1.05)
+#  O3, i.e. 5% of the B sites empty.  Those two rows are also the only ones that do not
+#  come out exact -- 0.75/1.05 = 5/7 of 80 sites is 57.14 -- so they are rounded to whole
+#  sites here, and the realised composition is given beside each.
+# =====================================================================================
+
+families:
+
+  # ===================================================================================
+  #  LISTS 1 + 2 -- stoichiometric, A and B sublattices full.  26 compounds.
+  #  Eighths are exact on 80 sites (1/8 = 10 sites).
+  # ===================================================================================
+
+  # --- Sr/Ba, B = Fe/Co --------------------------------------------------- 10 compounds
+  # Sr0.75Ba0.25FeO3, Sr0.75Ba0.25Fe0.875Co0.125O3,
+  # Sr0.75Ba0.25Fe0.75Co0.25O3, Sr0.75Ba0.25Fe0.5Co0.5O3
+  - {a_dopant: Ba, b_dopant: Co, x_values: [0.250], y_values: [0.0, 0.125, 0.250, 0.500]}
+  # Sr0.625Ba0.375Fe0.375Co0.625O3
+  - {a_dopant: Ba, b_dopant: Co, x_values: [0.375], y_values: [0.625]}
+  # Sr0.5Ba0.5Fe0.75Co0.25O3, Sr0.5Ba0.5Fe0.5Co0.5O3, Sr0.5Ba0.5Fe0.25Co0.75O3
+  - {a_dopant: Ba, b_dopant: Co, x_values: [0.500], y_values: [0.250, 0.500, 0.750]}
+  # Sr0.25Ba0.75FeO3, Sr0.25Ba0.75Fe0.25Co0.75O3
+  - {a_dopant: Ba, b_dopant: Co, x_values: [0.750], y_values: [0.0, 0.750]}
+
+  # --- Sr/Ca, B = Fe/Co --------------------------------------------------- 16 compounds
+  # The five A-undoped rows are generated HERE, in the Ca family, not in both: at x = 0
+  # the A dopant is absent, so the Ba and Ca blocks would build the identical structure
+  # twice under two names (Sr1000_Ba000_* and Sr1000_Ca000_*).
+  # SrFeO3, SrFe0.875Co0.125O3, SrFe0.75Co0.25O3, SrFe0.5Co0.5O3, SrFe0.125Co0.875O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.0], y_values: [0.0, 0.125, 0.250, 0.500, 0.875]}
+  # Sr0.875Ca0.125Fe0.875Co0.125O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.125], y_values: [0.125]}
+  # Sr0.75Ca0.25Fe0.875Co0.125O3, Sr0.75Ca0.25Fe0.75Co0.25O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.250], y_values: [0.125, 0.250]}
+  # Sr0.625Ca0.375Fe0.625Co0.375O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.375], y_values: [0.375]}
+  # Sr0.5Ca0.5FeO3, Sr0.5Ca0.5Fe0.5Co0.5O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.500], y_values: [0.0, 0.500]}
+  # Sr0.375Ca0.625Fe0.375Co0.625O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.625], y_values: [0.625]}
+  # Sr0.25Ca0.75Fe0.625Co0.375O3, Sr0.25Ca0.75Fe0.25Co0.75O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.750], y_values: [0.375, 0.750]}
+  # Sr0.125Ca0.875FeO3, Sr0.125Ca0.875Fe0.125Co0.875O3
+  - {a_dopant: Ca, b_dopant: Co, x_values: [0.875], y_values: [0.0, 0.875]}
+
+  # ===================================================================================
+  #  LIST 3 -- A-site and B-site off-stoichiometry.  15 compounds.
+  #  Site counts below are out of 80 A and 80 B.
+  # ===================================================================================
+
+  # --- Sr/Ca, 5% A-site vacancy ------------------------------------------- 3 compounds
+  # Sr0.95    Fe0.875Co0.125O3   ->  76 Sr        +  4 vac,  70 Fe + 10 Co
+  # Sr0.75Ca0.2 Fe0.875Co0.125O3 ->  60 Sr + 16 Ca +  4 vac
+  # Sr0.7 Ca0.25Fe0.875Co0.125O3 ->  56 Sr + 20 Ca +  4 vac
+  - {a_dopant: Ca, b_dopant: Co, a_vac: 0.05,
+     x_values: [0.0, 0.200, 0.250], y_values: [0.125]}
+
+  # --- Sr/Ca, 10% A-site vacancy ------------------------------------------ 2 compounds
+  # Sr0.75Ca0.15Fe0.875Co0.125O3 ->  60 Sr + 12 Ca +  8 vac
+  # Sr0.65Ca0.25Fe0.875Co0.125O3 ->  52 Sr + 20 Ca +  8 vac
+  - {a_dopant: Ca, b_dopant: Co, a_vac: 0.10,
+     x_values: [0.150, 0.250], y_values: [0.125]}
+
+  # --- Sr/Ca, 15% and 20% A-site vacancy ---------------------------------- 2 compounds
+  # Sr0.6 Ca0.25Fe0.875Co0.125O3 ->  48 Sr + 20 Ca + 12 vac
+  - {a_dopant: Ca, b_dopant: Co, a_vac: 0.15, x_values: [0.250], y_values: [0.125]}
+  # Sr0.55Ca0.25Fe0.875Co0.125O3 ->  44 Sr + 20 Ca + 16 vac
+  - {a_dopant: Ca, b_dopant: Co, a_vac: 0.20, x_values: [0.250], y_values: [0.125]}
+
+  # --- Sr/Ca, A-EXCESS (A/B = 1.05) = 5% B-site vacancy ------------------- 2 compounds
+  # These are the only two rounded rows.  A1.05BO3 is written A1 B0.952 O3, and 0.75/1.05
+  # = 5/7 of 80 sites is 57.14, so:
+  #   Sr0.8 Ca0.25Fe0.875Co0.125O3 -> 61 Sr + 19 Ca  (nominal 60.95 / 19.05)
+  #   Sr0.75Ca0.3 Fe0.875Co0.125O3 -> 57 Sr + 23 Ca  (nominal 57.14 / 22.86)
+  #   both:  67 Fe + 9 Co + 4 B-vac  (nominal 66.5 / 9.5 / 3.81)
+  # Realised A/B is 1/0.95 = 1.0526 instead of 1.05, and B is Fe0.882Co0.118 instead of
+  # Fe0.875Co0.125.  Exact would need n_A divisible by 21 as well as by 80, i.e. 8400
+  # atoms, so this is the one place the list is approximated rather than met.
+  - {a_dopant: Ca, b_dopant: Co, b_vac: 0.05,
+     x_values: [0.2375, 0.2875], y_values: [0.1125]}
+
+  # --- Sr/Ba, 5% A-site vacancy, B = Fe ----------------------------------- 3 compounds
+  # Sr0.75Ba0.2  FeO3          ->  60 Sr + 16 Ba +  4 vac,  80 Fe
+  # (Sr0.75Ba0.25)0.95FeO3     ->  57 Sr + 19 Ba +  4 vac   (= Sr0.7125Ba0.2375, exact)
+  # Sr0.7 Ba0.25 FeO3          ->  56 Sr + 20 Ba +  4 vac
+  - {a_dopant: Ba, b_dopant: Co, a_vac: 0.05,
+     x_values: [0.200, 0.2375, 0.250], y_values: [0.0]}
+
+  # --- Sr/Ba, 10% A-site vacancy, B = Fe ---------------------------------- 1 compound
+  # Sr0.75Ba0.15FeO3           ->  60 Sr + 12 Ba +  8 vac
+  - {a_dopant: Ba, b_dopant: Co, a_vac: 0.10, x_values: [0.150], y_values: [0.0]}
+
+  # --- Sr/Ba, 5% A-site vacancy, doped B ---------------------------------- 2 compounds
+  # Sr0.75Ba0.2 Fe0.875Co0.125O3 ->  60 Sr + 16 Ba + 4 vac,  70 Fe + 10 Co
+  - {a_dopant: Ba, b_dopant: Co, a_vac: 0.05, x_values: [0.200], y_values: [0.125]}
+  # Sr0.5 Ba0.45Fe0.5  Co0.5  O3 ->  40 Sr + 36 Ba + 4 vac,  40 Fe + 40 Co
+  - {a_dopant: Ba, b_dopant: Co, a_vac: 0.05, x_values: [0.450], y_values: [0.500]}
+
+sqs:
+  # [5,4,4] of the 5-atom base -> 400 sites (80 A, 80 B, 240 O), 19.3 x 15.4 x 15.4 A.
+  # See point 3 in the header for why this shape and not [5,2,1] of the 40-site POSCAR.
+  supercell: [5, 4, 4]
+  # Pair cutoff 5.58 A covers the 1st (3.85 A) and 2nd (5.45 A) cation shells.  It has to
+  # stay below half the shortest box edge (15.4/2 = 7.7 A) or corrdump counts a pair with
+  # the atom's own periodic image.
+  cutoffs: {r2: 5.58, r3: 4.24, r4: 0}
+  timeout_sec: 10                     # 400 sites, up from 240 s at 320
+  n_procs: 8
+  pin_cpus: false                      # Linux-only CPU pinning; no-op elsewhere
+  clean_dir: true                      # keep only POSCAR in each o* dir
+  skip_existing: true                  # makes reruns resumable
+  require_commensurate: true           # refuse a composition the cell cannot hold exactly
+  # mcsqs always ends by being killed at timeout_sec, and a kill landing on one of its
+  # bestsqs.out rewrites truncates the file.  A header truncation raises ("POSCAR
+  # conversion failed"); an atom-block truncation parses SILENTLY into a cell with fewer
+  # atoms.  Every POSCAR is now checked against the expected atom count -- on write and on
+  # skip -- and a bad one is regenerated with a fresh seed this many times.
+  max_attempts: 2
+
+md:
+  # A frozen model (.pth / .pb / .pt2), NOT a checkpoint.  If the file sits beside this
+  # config, gen_md.py writes ../../../../<name> into input.lammps and submit.py uploads it
+  # once per submission; give an absolute path instead if it already lives on the node.
+  model_path: compressed_model.pt2
+  model_head: null                     # single-task model, so there is no head to record
+
+  # ---- what the LAMMPS build provides (not what the run should do) ----------------
+  # The dpa4C build at $LMP has the pair style compiled in and is launched under Kokkos
+  # (-k on g 1 -sf kk), so the deck asks for the /kk variant directly and there is no
+  # plugin to load -- `plugin load` on this build is a hard error, not a warning.
+  pair_style: dpa4spin/kk
+  atom_style: atomic
+  plugin: null
+
+  temperature_k: 300
+  run_ps: 200                          # -> 100000 steps at 0.002 ps
+  timestep_ps: 0.002
+  thermo_freq: 10
+  dump_freq: 100
+  pressure_bar: 0.0
+  tau_t: 0.1
+  tau_p: 0.5
+  velocity_seed: auto                  # 'auto' = deterministic per structure
+
+  # ---- stage 4: what collect_md.py hands the optimiser ----------------------------
+  # POSCAR_md_avg averages positions and the NPT cell over the LAST average_last_ps, not
+  # the last frame.  At dump_freq 100 / timestep 0.002 ps, 20 ps is ~100 frames.
+  average_last_ps: 20
+  # An atom whose RMS spread about its own mean exceeds this (A) changed sites during the
+  # window and keeps its last-frame position instead.  Watch this one here: there are no
+  # oxygen vacancies for O to hop into, but the A-deficient rows have up to 20% of the A
+  # sites empty, so A-site hopping is possible in a way it never was in config.yaml.
+  # A non-zero n_hoppers in md_avg_summary.csv is worth looking at rather than ignoring.
+  avg_rms_max: 0.5
+
+opt:
+  # dpa4.ckpt.pt (descriptor dpa4, fitting dpa4_ener), NOT dpa4c.ckpt.pt -- the two sit
+  # side by side here and differ by one character.
+  model_path: dpa4.ckpt.pt
+  model_head: perovskite
+  fmax: 0.005
+  pressure_gpa: 0
+  nsteps: 2000
+  traj_interval: 5
+
+phonon:
+  model_path: dpa4.ckpt.pt
+  model_head: perovskite
+  # Identity: the phonon supercell IS the 400-atom SQS cell.  15.4 A in the two short
+  # directions is the force-constant range this buys.
+  supercell_matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  displacement: 0.01
+  mesh: [20, 20, 20]
+  temperatures: {start: 670.0, stop: 1070.0, num: 5}
+  delete_band_yaml_after_stability: true
+
+analysis:
+  avg_mode: simple                     # 'boltz' collapses onto the lowest-G set
+  temps: [670, 1070]
+  s_config_a: 2.0                      # |a| in the paper's dS_config; sign fixed internally
+  mu_G: {670: -5.1768, 1070: -5.6699}      # per 1/2 O2, interpolated in T
+  mu_H: {670: -4.37519, 1070: -4.304685}
+
+dispatch:
+  machine_json: machine.json           # Bohrium credentials + batch/context type
+  resources_json: resources.json       # only the base values; overridden below
+
+  #   precedence:  dispatch.<stage>.<key>  >  dispatch.<key>  >  the JSON's own value
+  # Check before spending GPU hours:  python submit.py <stage> config_feco.yaml --dry-run
+  machine_type: "c12_m92_1 * NVIDIA V100"
+  image_name: registry.dp.tech/dptech/dp/native/prod-591/dpa4-spin-lmp:9.0
+  # 400 atoms, not 320: a group of 5 x 200 ps NPT is ~1.6x the wall time it was under
+  # config.yaml.  Check the first group's log.lammps before raising this.
+  group_size: 4
+
+  # ---- filling the GPU: group_size x para_deg -------------------------------------
+  # group_size is how many tasks share a JOB; para_deg is how many of them run AT THE
+  # SAME TIME on the node.  They are independent, and only para_deg touches the GPU:
+  #
+  #     group_size 4, para_deg 1  ->  4 tasks, one after another   (4 x per-task)
+  #     group_size 4, para_deg 2  ->  4 tasks, two at a time       (2 x per-task)
+  #     group_size 8, para_deg 4  ->  8 tasks, four at a time      (2 x per-task)
+  #
+  # 400 atoms is a small system for a V100 -- a DP force call does not come close to
+  # saturating it, and the LBFGS driver spends much of its time in Python -- so running
+  # several structures concurrently is close to free until GPU MEMORY runs out.  That is
+  # the limit to watch: each concurrent task loads its own copy of the model.  If a job
+  # dies with CUDA out of memory, halve para_deg first, not group_size.
+  #
+  # Values below are starting points, not measurements.  The way to check is the first
+  # job: per-task wall time at para_deg 2 should be well under 2x what it is at 1.  If it
+  # is exactly 2x, the GPU was already saturated and para_deg is buying nothing.
+  # Only para_deg 1 is guaranteed safe; leave phonon there.
+  para_deg: 1                          # default for any stage that does not set its own
+
+  md:
+    machine_type: "c12_m92_1 * NVIDIA V100"
+    image_name: registry.dp.tech/dptech/dp/native/prod-591/dpa4-spin-lmp:9.0
+    source_list: [/root/dp-outisli-env/bin/activate]
+    command: "$LMP -k on g 1 -sf kk -in input.lammps > log.lammps"
+    envs:
+      LMP: /root/dpa4C-lammps/lammps/lammps-patch_4Jul2026-newtonian-spin/build/lmp
+      LD_LIBRARY_PATH: /root/deepmd-kit-outisli-cpp/lib:$LD_LIBRARY_PATH
+    job_name: clc_md_feco
+    # 4 tasks per job, 2 resident on the GPU at once -> 2 waves, i.e. the wall time of a
+    # sequential group_size 2 for twice the throughput.  Both lmp processes are launched
+    # with `-k on g 1` and so share device 0; Kokkos time-slices them.
+    group_size: 4
+    para_deg: 2
+    forward_files: [conf.lmp, input.lammps]
+    backward_files: [log.lammps, traj.lammpstrj]
+    forward_common_files: []
+  opt:
+    machine_type: "c12_m92_1 * NVIDIA V100"
+    image_name: registry.dp.tech/dptech/dp/native/prod-591/dpa4-spin-lmp:9.0
+    # Two pythons in this image, only one with deepmd: `which phonopy` is
+    # /opt/mamba/bin/phonopy (conda base, first on PATH) but `which dp` is
+    # /opt/deepmd-kit/bin/dp, so a bare `python` is mamba's and cannot import deepmd.
+    # Leading PATH with the deepmd prefix is what "activating" it means here; see
+    # config.yaml's opt block for the full note.  [] is required rather than omitting the
+    # key -- resources.json still carries the old venv path, and resolve_dispatch only
+    # overrides a value that is not None.
+    source_list: []
+    envs:
+      PATH: /opt/deepmd-kit/bin:$PATH
+    job_name: clc_opt_feco
+    # The stage that wastes the most GPU: LBFGS is one force call per step with ASE
+    # bookkeeping between, so a single relaxation leaves the card mostly idle.  8 per job,
+    # 4 concurrent -> 2 waves.  Cheapest stage per task, so queue wait dominates and a
+    # bigger group pays off twice.
+    group_size: 8
+    para_deg: 4
+    forward_files: [POSCAR_md_avg]
+    backward_files: [opt.traj, opt_result.json]
+    forward_common_files: [dp_opt.py]
+  phonon:
+    machine_type: "c12_m92_1 * NVIDIA V100"
+    image_name: registry.dp.tech/dptech/dp/native/prod-591/dpa4-spin-lmp:9.0
+    # The stage that needs BOTH halves, from an image that ships them in different prefixes
+    # (see opt).  The image's phonopy is /opt/mamba/bin/phonopy -- the wrong python -- so
+    # phonopy must also exist under /opt/deepmd-kit.  Add phonopy to the deepmd prefix,
+    # never deepmd to the phonopy one: a stock deepmd-kit cannot load a dpa4c model
+    # ("Unknown descriptor type: dpa4c"), so that direction is a dead end.
+    #
+    # WHAT THIS REPLACES: `source_list: []` + `conda activate phonopy_env`, an env picked
+    # for phonopy alone.  Every job died at
+    #     File "dp_phonon.py", line 83, in main
+    #       from deepmd.calculator import DP
+    #     ModuleNotFoundError: No module named 'deepmd'
+    # Leaving the conda line out is not sufficient on its own -- the image's default PATH
+    # already leads with /opt/mamba/bin, so a bare `python` reproduces the same failure.
+    source_list: []
+    envs:
+      PATH: /opt/deepmd-kit/bin:$PATH
+    prepend_script:
+      # Better baked into the image; this is the fallback until it is.  --no-deps so pip
+      # cannot swap out the numpy/torch the deepmd build was compiled against, and seekpath
+      # because auto_band_structure() imports it while a plain `pip install phonopy` does
+      # not pull it in.  No-op once the prefix has phonopy.
+      - python -c "import phonopy" 2>/dev/null || python -m pip install --no-deps --quiet phonopy spglib seekpath
+      # Names the interpreter that actually ran and proves both imports resolve, in the job
+      # header rather than as a traceback after the queue wait.
+      - python -c "import sys, deepmd, phonopy; print('[env]', sys.executable, 'phonopy', phonopy.__version__)"
+    job_name: clc_phonon_feco
+    # Finite displacements on 400 atoms with no symmetry -- the most expensive stage, and
+    # more so than it was at 320.  para_deg stays 1: this is the one stage where a single
+    # task can already fill the card, and two concurrent ones is how you get an OOM after
+    # the queue wait.
+    group_size: 1
+    para_deg: 1
+    forward_files: [optimized_POSCAR]
+    backward_files: [energy.txt, thermal_properties.yaml, stability.txt]
+    forward_common_files: [dp_phonon.py]
