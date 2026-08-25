@@ -22,6 +22,11 @@ dependencies = [
 submit = ["dpdispatcher"]
 plot = ["matplotlib", "scipy"]
 analysis = ["phonopy", "ase", "openpyxl"]
+# rl_builder.py's MDAveragedOptBuilder: local (non-Bohrium) MD + DP relax for
+# rl-matdesign's per-episode reward. deepmd-kit itself is not listed here since
+# rl-matdesign's own training env already requires it; rl-matdesign must also be
+# importable on PYTHONPATH in that same env (not a PyPI dependency of this package).
+rl_reward = ["ase"]
 all = ["dpdispatcher", "matplotlib", "scipy", "phonopy", "ase", "openpyxl"]
 
 [project.scripts]
