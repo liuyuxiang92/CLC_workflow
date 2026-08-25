@@ -2,8 +2,16 @@
 """
 Build a mixed-type dpdata dataset of measured oxygen capacity for property training.
 
-    clc delta config_feco.yaml --xlsx <experiment.xlsx> \
+    clc delta config_feco.yaml --xlsx <experiment.xlsx> [<more.xlsx> ...] \
+           [--sheet S | --sheet S1 S2 ...] \
            [--source opt|md_avg] [--out delta_dataset] [--dry-run]
+
+Several spreadsheets are read and STACKED into one dataset -- separate measurement
+campaigns feeding one training set.  Every row keeps a `source` column naming the file it
+came from, so `source` + `block` + `xlsx_row` still identifies one cell; without it the
+row numbers of two workbooks would collide silently.  A (compound, window, T) measured in
+more than one file is reported rather than quietly duplicated, since a repeated label is
+either a genuine replicate or the same file passed twice.
 
 One frame per (structure, measurement).  The structure supplies coordinates and cell;
 the experiment supplies the label and the conditions it was measured at:
@@ -146,6 +154,14 @@ def parse_temperature(v):
         return None
 
 
+def _sheet_arg(v):
+    """argparse hands back strings; a bare number means a sheet INDEX, not a name."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return v
+
+
 def read_measurements(xlsx, sheet=0):
     """
     Every (compound, pressure window, temperature) cell of the sheet as one row.
@@ -219,8 +235,73 @@ def read_measurements(xlsx, sheet=0):
                 rows.append({"formula_raw": str(label), "formula": clean_formula(label),
                              "p_high_atm": p_hi, "p_low_atm": p_lo, "t_c": t,
                              "delta": float(v), "flagged": r in red_rows,
+                             "source": os.path.basename(str(xlsx)),
                              "block": i + 1, "xlsx_row": r + 1})
     return pd.DataFrame(rows)
+
+
+# the columns that make one measurement the same measurement, for duplicate reporting
+_MEAS_KEY = ["formula", "p_high_atm", "p_low_atm", "t_c"]
+
+
+def read_all_measurements(xlsxs, sheets):
+    """
+    Read every spreadsheet and stack them, keeping each row's origin.
+
+    `sheets` is one sheet applied to all files, or one per file.  Reading them separately
+    rather than concatenating the workbooks matters for the red-cell scan: `flagged` comes
+    from cell formatting, which is per workbook.
+    """
+    if len(sheets) == 1:
+        sheets = sheets * len(xlsxs)
+    if len(sheets) != len(xlsxs):
+        raise SystemExit(
+            f"[ERROR] --sheet was given {len(sheets)} value(s) for {len(xlsxs)} "
+            f"spreadsheet(s).\n"
+            f"        Give one sheet to apply to all of them, or one per file in the "
+            f"same order.")
+
+    frames = []
+    for xlsx, sheet in zip(xlsxs, sheets):
+        if not os.path.isfile(xlsx):
+            raise SystemExit(f"[ERROR] no such spreadsheet: {xlsx}")
+        m = read_measurements(xlsx, sheet)
+        if m.empty:
+            print(f"[warn] {xlsx}: no measurements read; is --sheet right?")
+        frames.append(m)
+
+    seen = [f for f in frames if not f.empty]
+    if not seen:
+        raise SystemExit("[ERROR] no measurements in any spreadsheet")
+    meas = pd.concat(seen, ignore_index=True)
+
+    # A basename appearing twice would make `source` ambiguous, which defeats the point.
+    bases = [os.path.basename(str(x)) for x in xlsxs]
+    if len(set(bases)) != len(bases):
+        raise SystemExit(
+            f"[ERROR] two spreadsheets share a filename: "
+            f"{', '.join(sorted({b for b in bases if bases.count(b) > 1}))}.\n"
+            f"        `source` records the basename, so it could not tell the rows "
+            f"apart.  Rename one, or copy them to distinct names first.")
+    return meas
+
+
+def report_duplicates(meas):
+    """Measurements repeated across files -- a replicate, or the same file twice."""
+    if meas["source"].nunique() < 2:
+        return
+    dup = meas[meas.duplicated(_MEAS_KEY, keep=False)]
+    if dup.empty:
+        return
+    groups = dup.groupby(_MEAS_KEY)
+    print(f"[warn] {groups.ngroups} measurement(s) appear in more than one spreadsheet; "
+          f"all copies are kept as separate frames")
+    for (formula, hi, lo, t), g in list(groups)[:5]:
+        where = ", ".join(f"{r['source']}:row{r['xlsx_row']}={r['delta']:g}"
+                          for _, r in g.iterrows())
+        print(f"       {formula}  {hi:g}->{lo:g} atm  {t:g} C   {where}")
+    if groups.ngroups > 5:
+        print(f"       ... and {groups.ngroups - 5} more")
 
 
 # ------------------------------------------------------------------------- the manifest
@@ -276,8 +357,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config")
-    ap.add_argument("--xlsx", required=True, help="the measured dd(P, T) spreadsheet")
-    ap.add_argument("--sheet", default=0, help="sheet name or index (default: the first)")
+    ap.add_argument("--xlsx", required=True, nargs="+",
+                    help="the measured dd(P, T) spreadsheet(s); several are stacked into "
+                         "one dataset and each row records which file it came from")
+    ap.add_argument("--sheet", default=[0], nargs="+",
+                    help="sheet name or index (default: the first).  One value applies "
+                         "to every spreadsheet; or give one per --xlsx, in the same order")
     ap.add_argument("--source", choices=sorted(SOURCES), default="opt",
                     help="which structure to use: 'opt' = optimized_POSCAR (default), "
                          "'md_avg' = POSCAR_md_avg")
@@ -325,14 +410,18 @@ def main(argv=None):
     if man.empty:
         sys.exit("[ERROR] no manifest rows selected")
 
-    meas = read_measurements(args.xlsx, args.sheet)
+    sheets = [_sheet_arg(v) for v in args.sheet]
+    meas = read_all_measurements(args.xlsx, sheets)
     n_flagged = int(meas["flagged"].sum())
-    print(f"[*] spreadsheet  : {args.xlsx}")
+    per_file = meas.groupby("source").size()
+    print(f"[*] spreadsheet  : "
+          + ", ".join(f"{name} ({n} pts)" for name, n in per_file.items()))
     print(f"[*] measurements : {len(meas)} over {meas['formula'].nunique()} compound(s), "
           f"{n_flagged} flagged unreliable")
     for (hi, lo), g in meas.groupby(["p_high_atm", "p_low_atm"]):
         print(f"[*]   window {hi:g} atm -> {lo:g} atm : {len(g)} point(s), "
               f"T = {', '.join(f'{t:g}' for t in sorted(g['t_c'].unique()))} C")
+    report_duplicates(meas)
     if not args.keep_flagged and n_flagged:
         meas = meas[~meas["flagged"]].reset_index(drop=True)
         print(f"[*] dropped {n_flagged} flagged measurement(s); --keep-flagged to keep them")
@@ -381,8 +470,8 @@ def main(argv=None):
                               "match_err": round(err, 6),
                               "p_high_atm": m["p_high_atm"], "p_low_atm": m["p_low_atm"],
                               "t_c": m["t_c"], args.label_name: m["delta"],
-                              "flagged": bool(m["flagged"]), "block": m["block"],
-                              "xlsx_row": m["xlsx_row"]})
+                              "flagged": bool(m["flagged"]), "source": m["source"],
+                              "block": m["block"], "xlsx_row": m["xlsx_row"]})
 
     idx = pd.DataFrame(index)
     matched = meas[meas["formula"].isin(idx["formula"].unique())] if len(idx) else meas.iloc[:0]

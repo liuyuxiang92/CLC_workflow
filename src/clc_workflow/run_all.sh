@@ -25,7 +25,8 @@
 #   --retry-wait S    pause before retrying a failed submission (default 60s)
 #   --min-frac F      abort if a remote stage ends below this completion (default 0.5)
 #   --bob             also run stage 6.5 (structural check); off by default
-#   --delta-xlsx F    also run the optional build_delta_dataset.py step
+#   --delta-xlsx F    also run the optional `clc delta` step; repeat the flag to
+#                     stack several spreadsheets into one dataset
 #   --logdir DIR      per-stage logs (default ./pipeline_logs, in your cwd)
 #   --notify CMD      run CMD at the end; the summary is on its stdin
 #
@@ -44,7 +45,7 @@ set -uo pipefail
 # `clc run` exports CLC; the fallback lets the script still be run by path.
 CLC="${CLC:-clc}"
 CONFIG=""; FROM="1"; TO="9"; DRY=""; RETRIES=3; MIN_FRAC=0.5
-RUN_BOB=0; BOB_PLOT=""; DELTA_XLSX=""; LOGDIR=""; NOTIFY=""; RETRY_WAIT=60
+RUN_BOB=0; BOB_PLOT=""; DELTA_XLSX=(); LOGDIR=""; NOTIFY=""; RETRY_WAIT=60
 PY="${PYTHON:-python}"
 
 while [[ $# -gt 0 ]]; do
@@ -57,7 +58,7 @@ while [[ $# -gt 0 ]]; do
     --min-frac)   MIN_FRAC="$2"; shift 2 ;;
     --bob)        RUN_BOB=1; shift ;;
     --bob-plot)   RUN_BOB=1; BOB_PLOT="--plot"; shift ;;
-    --delta-xlsx) DELTA_XLSX="$2"; shift 2 ;;
+    --delta-xlsx) DELTA_XLSX+=("$2"); shift 2 ;;
     --logdir)     LOGDIR="$2"; shift 2 ;;
     --notify)     NOTIFY="$2"; shift 2 ;;
     # print the leading comment block, however long it grows
@@ -225,9 +226,9 @@ run_pipeline() {
   if [[ $RUN_BOB -eq 1 ]] && in_range 6.5; then
     run_local 6.5 stage6h_check_bob "$CLC" check-bob "$CONFIG" $BOB_PLOT || true
   fi
-  if [[ -n "$DELTA_XLSX" ]]; then
+  if [[ ${#DELTA_XLSX[@]} -gt 0 ]]; then
     run_local delta stage_delta_dataset \
-      "$CLC" delta "$CONFIG" --xlsx "$DELTA_XLSX" || true
+      "$CLC" delta "$CONFIG" --xlsx "${DELTA_XLSX[@]}" || true
   fi
 
   in_range 7   && { run_remote 7 phonon phonon      || return 1; }
