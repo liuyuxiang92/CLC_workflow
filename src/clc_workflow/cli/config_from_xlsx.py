@@ -2,12 +2,17 @@
 """
 Turn the compounds named in a measurement spreadsheet into a `families:` block.
 
-    clc config-from-xlsx measured.xlsx [more.xlsx ...] [--config config.yaml]
-    clc config-from-xlsx measured.xlsx --n-a-sites 80
+    clc config-from-xlsx measured.xlsx --config config.yaml      # edits config.yaml
+    clc config-from-xlsx measured.xlsx --config config.yaml --stdout   # just print it
 
-Prints YAML on stdout, with a comment above each line naming the compounds it covers.
-Paste it into config.yaml -- nothing is written for you, because the grouping is a
-judgement you should read before you generate thousands of structures from it.
+With --config, the file's `families:` block and its a_base / b_base are REWRITTEN from
+the compounds the spreadsheet names, and a config.yaml.bak is left beside it.  A comment
+above each entry names the compounds it covers.
+
+The edit is surgical -- the families block and two scalars, nothing else.  Loading the
+YAML and dumping it back would be far shorter and would silently destroy every comment in
+the file, which for this config is most of it.  The result is parsed before anything is
+overwritten, so a bad edit fails instead of landing.
 
 WHY THIS IS NOT ONE BLOCK PER COMPOUND.  A family block is an x_values x y_values CROSS
 PRODUCT.  Two compounds at (x=0.25, y=0.125) and (x=0.50, y=0.25) cannot share a block:
@@ -26,7 +31,11 @@ sublattice is full and B is short, so ABO3 with A/B = 1.05 is written A B0.952 O
 b_vac -- never an A excess, because no lattice holds 1.05 A per B on a full sublattice.
 """
 import argparse
+import re
 import sys
+from pathlib import Path
+
+import yaml
 from collections import Counter, defaultdict
 
 from clc_workflow.cli.build_delta_dataset import (A_SITE, B_SITE, _INVISIBLE,
@@ -107,6 +116,99 @@ def commensurate_problems(rows, n_sites):
     return bad
 
 
+
+# ------------------------------------------------------------------- editing config.yaml
+
+def _find_block(lines, key):
+    """
+    (start, end) line indices of a top-level `key:` block, end exclusive.
+
+    The block runs to the next top-level key -- a line starting at column 0 that is
+    neither blank nor a comment.  Column-0 COMMENTS stay inside the block on purpose:
+    config.yaml keeps commented-out family entries there, and those are old definitions
+    being replaced, not a header for whatever comes next.
+    """
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(rf"^{re.escape(key)}\s*:", ln):
+            start = i
+            break
+    if start is None:
+        return None, None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if ln[:1] not in ("", " ", "\t", "#") and re.match(r"^[A-Za-z_][\w-]*\s*:", ln):
+            end = j
+            break
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1                      # give the blank separator back to the next section
+    return start, end
+
+
+def _replace_scalar(lines, key, value):
+    """Set a top-level `key: value`, keeping any trailing comment on that line."""
+    for i, ln in enumerate(lines):
+        m = re.match(rf"^({re.escape(key)}\s*:\s*)(.*?)(\s*#.*)?$", ln)
+        if m:
+            if m.group(2).strip() == str(value):
+                return False
+            lines[i] = f"{m.group(1)}{value}{m.group(3) or ''}"
+            return True
+    return None                        # key absent
+
+
+def write_config(path, block_lines, a_base, b_base, backup=True):
+    """
+    Replace the `families:` block and the a_base/b_base lines of config.yaml in place.
+
+    A surgical text edit, NOT a YAML round-trip: safe_dump would silently discard every
+    comment in the file and reorder the keys, and this config is mostly comments.  Only
+    the lines that have to change are touched; every other byte survives.
+    """
+    path = Path(path)
+    original = path.read_text()
+    lines = original.splitlines()
+
+    changed = []
+    for key, val in (("a_base", a_base), ("b_base", b_base)):
+        r = _replace_scalar(lines, key, val)
+        if r is None:
+            lines.insert(0, f"{key}: {val}")
+            changed.append(f"{key} added")
+        elif r:
+            changed.append(f"{key} -> {val}")
+
+    start, end = _find_block(lines, "families")
+    if start is None:
+        lines += ["", *block_lines]
+        changed.append(f"families added ({len(block_lines) - 1} entries)")
+    else:
+        old = sum(1 for ln in lines[start:end] if re.match(r"^\s*-\s", ln))
+        lines[start:end] = block_lines
+        new = sum(1 for ln in block_lines if re.match(r"^\s*-\s", ln))
+        changed.append(f"families {old} -> {new} blocks")
+
+    updated = "\n".join(lines) + "\n"
+
+    # Parse before overwriting: a config that does not load is worse than no change, and
+    # this is the one failure the user could not easily undo by hand.
+    try:
+        parsed = yaml.safe_load(updated)
+    except yaml.YAMLError as e:
+        raise SystemExit(f"[ERROR] the edit would produce invalid YAML, so nothing was "
+                         f"written:\n{e}")
+    if not isinstance(parsed, dict) or not parsed.get("families"):
+        raise SystemExit("[ERROR] the edit lost the families block, so nothing was written")
+
+    if backup:
+        bak = path.with_suffix(path.suffix + ".bak")
+        bak.write_text(original)
+        print(f"[*] backup       : {bak}", file=sys.stderr)
+    path.write_text(updated)
+    print(f"[*] wrote        : {path}  ({'; '.join(changed)})", file=sys.stderr)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -118,8 +220,14 @@ def main(argv=None):
     ap.add_argument("--b-base", default=None,
                     help="B-site base species (default: the most common one in the sheet)")
     ap.add_argument("--config", default=None,
-                    help="a config.yaml to take sqs.supercell and base_poscar from, so "
-                         "the compounds can be checked against the real site count")
+                    help="the config.yaml to UPDATE: its families block and a_base/b_base "
+                         "are rewritten from the spreadsheet, and its sqs.supercell is "
+                         "used to check the compounds are realisable.  --stdout to print "
+                         "instead of writing")
+    ap.add_argument("--stdout", action="store_true",
+                    help="print the families block instead of editing --config")
+    ap.add_argument("--no-backup", action="store_true",
+                    help="do not leave a config.yaml.bak beside the edited file")
     ap.add_argument("--n-a-sites", type=int, default=None,
                     help="A sites in the supercell, if you would rather say it directly "
                          "than point at a config (`clc sqs --dry-run` prints it)")
@@ -196,11 +304,24 @@ def main(argv=None):
     # commensurability, if we were told the site count
     n_sites = args.n_a_sites
     if n_sites is None and args.config:
-        from clc_workflow.clc_config import load_config
-        from clc_workflow.sqs_generator import supercell_site_counts
-        cfg = load_config(args.config)
-        n_sites = supercell_site_counts(cfg["sqs"]["supercell"], cfg["base_poscar"])[0]
-        print(f"[*] {n_sites} A sites from {args.config}", file=sys.stderr)
+        # The site count needs the base POSCAR, which a config may legitimately point at
+        # before you have put it there.  That is a reason to skip the CHECK, not to refuse
+        # to write the families -- so warn and carry on rather than dying with a traceback
+        # and leaving the config untouched.
+        try:
+            from clc_workflow.clc_config import load_config
+            from clc_workflow.sqs_generator import supercell_site_counts
+            cfg = load_config(args.config)
+            n_sites = supercell_site_counts(cfg["sqs"]["supercell"], cfg["base_poscar"])[0]
+            print(f"[*] {n_sites} A sites from {args.config}", file=sys.stderr)
+        except FileNotFoundError as e:
+            print(f"[warn] cannot check the compounds are realisable: {e.filename} is "
+                  f"missing.\n"
+                  f"       Put the base POSCAR there, or pass --n-a-sites, and rerun to "
+                  f"check.", file=sys.stderr)
+        except Exception as e:
+            print(f"[warn] cannot check the compounds are realisable ({type(e).__name__}: "
+                  f"{e})", file=sys.stderr)
     if n_sites:
         bad = commensurate_problems(rows, n_sites)
         if bad:
@@ -235,7 +356,7 @@ def main(argv=None):
             return "0.0"
         return f"{round(v, ND):.{ND}f}".rstrip("0").rstrip(".")
 
-    print("families:")
+    block = ["families:"]
     for (a_dop, b_dop, x, a_vac, b_vac), members in sorted(
             groups.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2])):
         ys = sorted({m["y"] for m in members})
@@ -246,9 +367,24 @@ def main(argv=None):
             extra += f", a_vac: {fmt(a_vac)}"
         if b_vac:
             extra += f", b_vac: {fmt(b_vac)}"
-        print(f"  # {names}")
-        print(f"  - {{a_dopant: {a_dop}, b_dopant: {b_dop}, "
-              f"x_values: [{fmt(x)}], y_values: [{', '.join(fmt(v) for v in ys)}]{extra}}}")
+        block.append(f"  # {names}")
+        block.append(f"  - {{a_dopant: {a_dop}, b_dopant: {b_dop}, "
+                     f"x_values: [{fmt(x)}], y_values: [{', '.join(fmt(v) for v in ys)}]"
+                     f"{extra}}}")
+
+    if args.config and not args.stdout:
+        write_config(args.config, block, a_base, b_base, backup=not args.no_backup)
+        # The top-level x_values / y_values are the defaults for a family that omits
+        # them.  Every generated block names both, so they no longer reach anything --
+        # say so, because a stale [0.750] sitting at the top of the file reads like it is
+        # still in force.
+        top = yaml.safe_load(Path(args.config).read_text())
+        if "x_values" in top or "y_values" in top:
+            print("[*] note         : the top-level x_values / y_values are now unused -- "
+                  "every generated block sets its own", file=sys.stderr)
+        print(f"[*] next         : clc sqs {args.config} --dry-run", file=sys.stderr)
+    else:
+        print("\n".join(block))
     return 0
 
 
