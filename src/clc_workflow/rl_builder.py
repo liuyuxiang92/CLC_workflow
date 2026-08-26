@@ -59,7 +59,22 @@ class MDAveragedOptBuilder:
         if not md.get("model"):
             raise ValueError(
                 "MDAveragedOptBuilder needs 'md.model' — a LAMMPS-ready (frozen) "
-                "DeepMD model, e.g. dpa4c.ckpt.pt."
+                "DeepMD model, e.g. dpa4c.pth."
+            )
+        if str(md["model"]).endswith((".ckpt.pt", ".ckpt")):
+            from .lammps_io import freeze_command
+
+            raise ValueError(
+                f"md.model = {md['model']!r} looks like a training checkpoint. No "
+                "LAMMPS pair style (Kokkos or stock) can load one directly — only "
+                "dp_opt.py/dp_phonon.py and this builder's own `opt.model` step "
+                "read a checkpoint via the ASE calculator. Freeze it first:\n"
+                f"    {freeze_command('model.pth', md.get('head') or '<HEAD>', md['model'])}\n"
+                "then set md.model to the frozen .pth/.pb file"
+                + ("" if md.get("head") else " (and md.head to the head you froze)")
+                + ". Checked once at builder construction, before any episode runs, "
+                "so a misconfigured MD model fails immediately instead of after a "
+                "warmup episode already spent real predictor time."
             )
         if not md.get("lmp_bin"):
             raise ValueError(
