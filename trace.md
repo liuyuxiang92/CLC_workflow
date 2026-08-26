@@ -447,3 +447,23 @@ composition mcsqs cannot handle.
   ignore rule never applied and they showed as modified noise on every install.
 - Pushed as a branch rather than straight to `main` (all prior history is direct-to-main);
   80 files, +10062/-530.
+
+### EARS — Progress (2026-08-26 19:42)
+<!-- concepts: rl-builder-debugging, deepmd-lammps-deployment -->
+User is running MDAveragedOptBuilder for the first time on a real GPU machine and
+hit a chain of local-environment issues (not code bugs, mostly): (1) md.lmp_bin
+placeholder not filled in, (2) md.model was an unfrozen .ckpt.pt checkpoint (fixed
+by adding a fail-fast check in __init__, mirroring gen_md.py's own guard), (3)
+wrong pair_style/plugin convention guessed twice (dpa4spin/kk assumed from the
+Bohrium image's config.yaml, then a stock deepmd/plugin guess) before asking the
+user to run `lmp -h | grep -iE "kokkos|deepmd|dpa4|plugin"` for ground truth --
+their build actually registers `deepmd`/`deepmd/kk` (not dpa4spin) and has no
+plugin package at all. Lesson: don't guess a third LAMMPS build convention off
+partial log evidence; ask for `lmp -h` output up front next time a build's pair
+style naming is in question. (4) Current issue: deepmd-kit's own CPU-variant
+install is missing libdeepmd_backend_ptexpt.so (the PyTorch "Exportable" backend
+plugin), needed to load whatever format dpa4c.pth was frozen in -- an
+infra/install issue, not something fixable from rl-matdesign/CLC_workflow config.
+Added `md.env` (dict) support to MDAveragedOptBuilder's subprocess.run call so the
+user can set DP_BACKEND_PLUGIN_PATH/LD_LIBRARY_PATH etc. via YAML rather than
+relying on shell env persisting into a detached/nohup training run.

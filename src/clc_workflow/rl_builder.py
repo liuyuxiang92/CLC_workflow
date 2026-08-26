@@ -34,6 +34,12 @@ Requires ``ase`` + ``deepmd-kit`` (the ``rl_reward`` extra) and rl-matdesign
 importable on PYTHONPATH in the same environment (this module imports
 ``rl_matdesign.predictors.builders.defect_site`` and
 ``rl_matdesign.utils.structure``).
+
+``md.env`` (optional dict, e.g. ``{DP_BACKEND_PLUGIN_PATH: /path/to/lib,
+LD_LIBRARY_PATH: ...}``) is merged into the LAMMPS subprocess's environment on
+top of the current process's own ``os.environ`` — some deepmd-kit builds need
+one of these set to find a backend plugin .so, and setting it here survives a
+detached/nohup training run better than relying on the launching shell's env.
 """
 from __future__ import annotations
 
@@ -161,7 +167,8 @@ class MDAveragedOptBuilder:
                 f.write(deck)
 
             cmd = [self.md["lmp_bin"], *self.md.get("lmp_args", []), "-in", "input.lammps"]
-            result = subprocess.run(cmd, cwd=scratch, capture_output=True, text=True)
+            run_env = {**os.environ, **{str(k): str(v) for k, v in (self.md.get("env") or {}).items()}}
+            result = subprocess.run(cmd, cwd=scratch, capture_output=True, text=True, env=run_env)
             if result.returncode != 0:
                 raise RuntimeError(
                     f"LAMMPS MD failed (exit {result.returncode}) in {scratch}:\n"
