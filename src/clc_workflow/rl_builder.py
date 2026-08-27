@@ -124,6 +124,44 @@ class MDAveragedOptBuilder:
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _check_structure(structure, min_dist: float) -> None:
+        """
+        Reject a candidate whose atoms overlap, before any MD time is spent on it.
+
+        A substitution never moves an atom, so this can only fire on the interstitial
+        branch of DefectSiteBuilder -- but that is exactly the branch that can place an
+        atom on top of another, and a close contact does not announce itself as a bad
+        structure.  It announces itself 30 steps into MD as a Kokkos abort inside
+        `NBinKokkos::bin_atoms()`, which reads like a GPU problem and is not one.
+
+        Distances use the minimum-image convention via pymatgen's distance_matrix, so a
+        contact across a periodic boundary counts.
+
+        The 1.7 A default is calibrated against real output of DefectSiteBuilder on
+        perovskite.vasp, not guessed.  The substitution and vacancy branches both leave
+        every atom on a template site, so their true minimum is the B-O bond at 1.926 A;
+        the interstitial branch with `interstitial_min_dist: 1.5` produces Ca-Ca at
+        1.506 A and Ca-Sr at 1.526 A.  1.7 A sits in the gap and separates the two
+        cleanly.  Anything much lower -- 1.2 A, say -- passes the broken structures too
+        and the check does nothing.
+        """
+        import numpy as _np
+
+        n = len(structure)
+        d = structure.distance_matrix + _np.eye(n) * 1e9
+        i, j = _np.unravel_index(d.argmin(), d.shape)
+        dmin = float(d[i, j])
+        if dmin < min_dist:
+            raise ValueError(
+                f"candidate structure has overlapping atoms: {structure[i].specie}"
+                f"(#{i}) and {structure[j].specie}(#{j}) are {dmin:.3f} A apart, "
+                f"below md.min_dist = {min_dist:.3f} A. Formula "
+                f"{structure.composition.formula}, {n} atoms. Raise "
+                "`interstitial_min_dist` in the rl-matdesign config, or lower "
+                "`md.min_dist` if this contact is intentional."
+            )
+
     def _md_average_and_optimize(self, atoms: "ase.Atoms", *, tag: int, rng: np.random.Generator):
         from pymatgen.io.ase import AseAtomsAdaptor
 
@@ -136,11 +174,13 @@ class MDAveragedOptBuilder:
 
         type_map = sorted({s for s in atoms.get_chemical_symbols()})
         scratch = tempfile.mkdtemp(prefix=f"rl_md_{tag}_", dir=self.scratch_root)
+        failed = False
         try:
             conf_path = os.path.join(scratch, "conf.lmp")
             input_path = os.path.join(scratch, "input.lammps")
 
             structure = AseAtomsAdaptor.get_structure(atoms)
+            self._check_structure(structure, float(self.md.get("min_dist", 1.7)))
             write_conf_lmp(conf_path, structure, type_map, source="rl_matdesign candidate")
 
             nsteps = int(self.md.get("nsteps", 100000))
@@ -213,6 +253,15 @@ class MDAveragedOptBuilder:
                 steps=int(self.opt.get("steps", 2000)),
                 relax_cell=bool(self.opt.get("relax_cell", True)),
             )
+        except BaseException:
+            # The failure messages above name `scratch` so the deck, conf.lmp and the
+            # partial trajectory can be inspected -- deleting it here would make every
+            # one of those messages point at a directory that no longer exists, which is
+            # how a reproducible MD blow-up turns into an unreproducible one.
+            failed = True
+            raise
         finally:
-            if not self.keep_scratch:
+            if failed:
+                print(f"[rl_builder] kept scratch dir for inspection: {scratch}")
+            elif not self.keep_scratch:
                 shutil.rmtree(scratch, ignore_errors=True)
