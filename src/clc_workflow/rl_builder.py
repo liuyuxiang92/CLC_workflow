@@ -40,6 +40,19 @@ LD_LIBRARY_PATH: ...}``) is merged into the LAMMPS subprocess's environment on
 top of the current process's own ``os.environ`` — some deepmd-kit builds need
 one of these set to find a backend plugin .so, and setting it here survives a
 detached/nohup training run better than relying on the launching shell's env.
+
+**A failed realization does not fail the candidate.** ``build()`` tries every
+one of the ``n_configs`` random realizations independently; if MD or the
+post-MD relax raises for one (a real failure mode in practice — an unstable
+NPT run, a GPU/compute-capability mismatch, an interstitial too close to an
+existing atom), that realization is skipped (logged, not silently dropped)
+and the rest still run. The reward is computed from whichever realizations
+succeeded. Only if *all* of them fail does ``build()`` raise — there is
+nothing left to score at that point, and propagating that up (rather than
+swallowing it) is what lets a systematic problem (wrong GPU target, bad
+model path) surface instead of silently reporting a meaningless reward. A
+skipped realization still cost real MD time; this is about not letting one
+bad roll crash an entire training run, not about making failures free.
 """
 from __future__ import annotations
 
@@ -113,10 +126,36 @@ class MDAveragedOptBuilder:
         if rng is None:
             rng = np.random.default_rng()
         raw_structures = self._inner.build(candidate, n_configs=n_configs, rng=rng)
-        return [
-            self._md_average_and_optimize(atoms, tag=i, rng=rng)
-            for i, atoms in enumerate(raw_structures)
-        ]
+
+        results: List["ase.Atoms"] = []
+        failures: List[str] = []
+        for i, atoms in enumerate(raw_structures):
+            try:
+                results.append(self._md_average_and_optimize(atoms, tag=i, rng=rng))
+            except Exception as exc:  # noqa: BLE001 - one bad realization must not
+                # kill the whole (possibly multi-hour) training run. The GPU time for
+                # this attempt was still spent -- it just doesn't get to poison every
+                # other realization's reward, or the episode/warmup loop calling this.
+                msg = f"{type(exc).__name__}: {exc}"
+                failures.append(msg)
+                print(
+                    f"[rl_builder] structure {i + 1}/{len(raw_structures)} failed "
+                    f"MD/relax, skipping it: {msg}"
+                )
+
+        if not results:
+            raise RuntimeError(
+                f"MDAveragedOptBuilder: all {len(raw_structures)} realizations failed "
+                f"MD/relax for this candidate -- nothing left to score. First failure: "
+                f"{failures[0] if failures else '?'}"
+            )
+        if failures:
+            print(
+                f"[rl_builder] {len(failures)}/{len(raw_structures)} realizations "
+                f"failed and were skipped; reward computed from the remaining "
+                f"{len(results)}."
+            )
+        return results
 
     def composition_formula(self, candidate: Dict[str, Dict[str, Any]]) -> Optional[str]:
         fn = getattr(self._inner, "composition_formula", None)
