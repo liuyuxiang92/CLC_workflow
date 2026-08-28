@@ -100,6 +100,13 @@ class MDAveragedOptBuilder:
                 "MDAveragedOptBuilder needs 'md.lmp_bin' — path to the LAMMPS binary "
                 "on THIS machine (local execution, no Bohrium dispatch)."
             )
+        # md.model and md.lmp_bin are read by the LAMMPS subprocess, which runs with
+        # cwd=<scratch dir> (a fresh tempdir per structure) -- a relative path would
+        # resolve against THAT directory, not wherever this process was launched
+        # from, and silently point at nothing. Resolve to absolute now, once, while
+        # os.getcwd() still means what the user meant when they wrote the config.
+        md["model"] = os.path.abspath(md["model"])
+        md["lmp_bin"] = os.path.abspath(md["lmp_bin"])
         self.md: Dict[str, Any] = md
 
         opt = dict(cfg.get("opt") or {})
@@ -108,6 +115,10 @@ class MDAveragedOptBuilder:
                 "MDAveragedOptBuilder needs 'opt.model' — the (possibly different) "
                 "DeepMD checkpoint used to relax the MD-averaged structure."
             )
+        # opt.model is loaded in-process (no cwd change involved), so a relative path
+        # already works -- resolved here too anyway, purely for consistency/robustness
+        # against any future code path that changes the process's cwd mid-run.
+        opt["model"] = os.path.abspath(opt["model"])
         self.opt: Dict[str, Any] = opt
 
         self.keep_scratch: bool = bool(cfg.get("md_keep_scratch", False))
