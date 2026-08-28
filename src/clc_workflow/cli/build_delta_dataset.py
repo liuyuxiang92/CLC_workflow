@@ -4,7 +4,8 @@ Build a mixed-type dpdata dataset of measured oxygen capacity for property train
 
     clc delta config_feco.yaml --xlsx <experiment.xlsx> [<more.xlsx> ...] \
            [--sheet S | --sheet S1 S2 ...] \
-           [--source opt|md_avg] [--out delta_dataset] [--dry-run]
+           [--source opt|md_avg] [--out delta_dataset] \
+           [--valid-frac F | --kfold K] [--dry-run]
 
 Several spreadsheets are read and STACKED into one dataset -- separate measurement
 campaigns feeding one training set.  Every row keeps a `source` column naming the file it
@@ -34,6 +35,13 @@ particular decoration are irrelevant to it.
 The structures are identical across the measurements of one compound -- only fparam
 differs -- which is exactly the shape a property model with frame parameters expects.
 
+HOW IT IS SPLIT.  One held-out set by default (--valid-frac), or K rotating ones
+(--kfold K) so every compound serves as validation exactly once -- `clc kfold` does the
+same to a dataset that already exists.  Either way the split is
+by COMPOUND, never by frame -- see the comment above the split for why.  The K folds are
+written once each, as disjoint directories; a fold's training set is the other K-1
+directories, listed for you in folds.json, so nothing is duplicated on disk.
+
 Output is deepmd/npy/mixed: one directory per atom count, with real_atom_types.npy
 carrying the per-frame species.  Mixed type is required here rather than convenient,
 because A-site- and B-site-deficient cells have fewer atoms than the stoichiometric ones
@@ -43,6 +51,7 @@ and a plain deepmd/npy system cannot hold both.
 deepmd input.json; change both together with --label-name.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -52,6 +61,7 @@ import numpy as np
 import pandas as pd
 
 from clc_workflow.clc_config import load_config, MANIFEST_NAME
+from clc_workflow.kfold import assign_folds, fold_manifest
 # source name -> (filenames to try, in order)
 SOURCES = {
     "md_avg": ["POSCAR_md_avg", "POSCAR_md_final"],   # legacy name still read
@@ -390,6 +400,12 @@ def main(argv=None):
     ap.add_argument("--valid-compounds", default=None,
                     help="comma list of formulas to hold out, overriding the random "
                          "choice -- use it to pin a split across reruns")
+    ap.add_argument("--kfold", type=int, default=0,
+                    help="write K disjoint folds instead of one train/valid split, so "
+                         "every compound is validation in exactly one fold.  Folds are "
+                         "balanced on FRAMES and split by compound, like --valid-frac, "
+                         "which this overrides.  Each fold is written once; folds.json "
+                         "lists the train/valid systems for each of the K runs")
     ap.add_argument("--type-map", default=None,
                     help="comma list fixing the species order; default is derived from "
                          "the manifest.  It is written to type_map.raw either way")
@@ -512,52 +528,91 @@ def main(argv=None):
     # its 600 K point in validation, and the validation score would measure interpolation
     # between two nearly identical rows rather than transfer to an unseen material.
     # Holding out whole compounds is the only split that answers the question being asked.
-    idx["split"] = "train"
-    if args.valid_frac > 0:
-        by_comp = idx.groupby("comp").size()
+    if args.kfold:
+        # ---- K rotating held-out sets --------------------------------------------
+        # The same rule -- whole compounds move together -- applied K times, so
+        # every compound is validation exactly once and no compound is ever in both
+        # sides of the same fold.  This is group K-fold, not plain K-fold; plain
+        # K-fold on frames would leak a compound's other temperatures and its other
+        # SQS realisations into training and report a score that means nothing.
+        if args.kfold < 2:
+            sys.exit("[ERROR] --kfold needs at least 2 folds "
+                     "(--kfold 0 or --valid-frac for a single split)")
         if args.valid_compounds:
-            want = {s.strip() for s in args.valid_compounds.split(",") if s.strip()}
-            held = sorted(idx.loc[idx["formula"].isin(want) | idx["comp"].isin(want),
-                                  "comp"].unique())
-            unknown = want - set(idx["formula"]) - set(idx["comp"])
-            for u in unknown:
-                print(f"    [WARN] --valid-compounds {u!r} matched nothing")
-        else:
-            # Shuffle compounds, take them until the frame target is met.  Aiming at a
-            # fraction of FRAMES rather than of compounds matters here: compounds carry
-            # between 4 and 7 measurements each, so 10% of compounds is not 10% of data.
-            rng = np.random.default_rng(args.seed)
-            order = list(by_comp.index)
-            rng.shuffle(order)
-            target = args.valid_frac * len(idx)
-            held, got = [], 0
-            for c in order:
-                if got >= target:
-                    break
-                held.append(c)
-                got += by_comp[c]
-            # The compound that crosses the target usually overshoots it by more than
-            # stopping short would undershoot -- with 4-7 measurements each, one compound
-            # is several percent of the whole set.  Keep whichever side is closer.
-            if len(held) > 1 and abs(got - by_comp[held[-1]] - target) < abs(got - target):
-                got -= by_comp[held.pop()]
-            held = sorted(held)
-        idx.loc[idx["comp"].isin(held), "split"] = "valid"
+            sys.exit("[ERROR] --valid-compounds pins one held-out set, --kfold rotates "
+                     "through K of them.  Use one or the other")
+        by_comp = idx.groupby("comp").size()
+        if len(by_comp) < args.kfold:
+            sys.exit(f"[ERROR] --kfold {args.kfold} needs at least {args.kfold} matched "
+                     f"compounds; only {len(by_comp)} matched.  Every fold has to hold "
+                     f"out a whole compound, so K cannot exceed the compound count")
+        # Balanced on FRAMES, not on compound count -- a compound carries between 4 and
+        # 7 measurements times n_sets frames, so dealing them round-robin would leave
+        # folds of visibly different size and the K scores would not be comparable.
+        # Shared with `clc kfold`, which does the same to an existing dataset.
+        fold_of = assign_folds(by_comp.to_dict(), args.kfold, args.seed)
+        idx["fold"] = idx["comp"].map(fold_of)
+        idx["split"] = "fold_" + idx["fold"].astype(str)
 
-    n_valid = int((idx["split"] == "valid").sum())
-    if args.valid_frac > 0:
-        print(f"\n[*] split        : {len(idx) - n_valid} train / {n_valid} valid frame(s) "
-              f"({n_valid / len(idx):.1%}), held out by compound")
-        for c in sorted(idx.loc[idx["split"] == "valid", "comp"].unique()):
-            f = idx.loc[idx["comp"] == c, "formula"].iloc[0]
-            print(f"[*]   valid: {c}  ({f}, {int((idx['comp'] == c).sum())} frames)")
-        if n_valid == 0:
-            print("[!]   nothing was held out -- too few compounds for this fraction")
-        elif n_valid == len(idx):
-            sys.exit("[ERROR] every compound went to validation; lower --valid-frac")
+        print(f"\n[*] split        : {args.kfold}-fold, held out by compound "
+              f"({len(by_comp)} compound(s), {len(idx)} frame(s))")
+        for k in range(args.kfold):
+            g = idx[idx["fold"] == k]
+            print(f"[*]   fold {k}: {len(g)} valid / {len(idx) - len(g)} train frame(s) "
+                  f"({len(g) / len(idx):.1%}), {g['comp'].nunique()} compound(s)")
+            for c in sorted(g["comp"].unique()):
+                f = g.loc[g["comp"] == c, "formula"].iloc[0]
+                print(f"[*]       {c}  ({f}, {int((idx['comp'] == c).sum())} frames)")
+        splits = [(f"fold_{k}", idx[idx["fold"] == k]) for k in range(args.kfold)]
+    else:
+        idx["split"] = "train"
+        if args.valid_frac > 0:
+            by_comp = idx.groupby("comp").size()
+            if args.valid_compounds:
+                want = {s.strip() for s in args.valid_compounds.split(",") if s.strip()}
+                held = sorted(idx.loc[idx["formula"].isin(want) | idx["comp"].isin(want),
+                                      "comp"].unique())
+                unknown = want - set(idx["formula"]) - set(idx["comp"])
+                for u in unknown:
+                    print(f"    [WARN] --valid-compounds {u!r} matched nothing")
+            else:
+                # Shuffle compounds, take them until the frame target is met.  Aiming at a
+                # fraction of FRAMES rather than of compounds matters here: compounds carry
+                # between 4 and 7 measurements each, so 10% of compounds is not 10% of data.
+                rng = np.random.default_rng(args.seed)
+                order = list(by_comp.index)
+                rng.shuffle(order)
+                target = args.valid_frac * len(idx)
+                held, got = [], 0
+                for c in order:
+                    if got >= target:
+                        break
+                    held.append(c)
+                    got += by_comp[c]
+                # The compound that crosses the target usually overshoots it by more than
+                # stopping short would undershoot -- with 4-7 measurements each, one compound
+                # is several percent of the whole set.  Keep whichever side is closer.
+                if len(held) > 1 and abs(got - by_comp[held[-1]] - target) < abs(got - target):
+                    got -= by_comp[held.pop()]
+                held = sorted(held)
+            idx.loc[idx["comp"].isin(held), "split"] = "valid"
 
-    splits = ([("train", idx[idx["split"] == "train"]), ("valid", idx[idx["split"] == "valid"])]
-              if args.valid_frac > 0 else [("", idx)])
+        n_valid = int((idx["split"] == "valid").sum())
+        if args.valid_frac > 0:
+            print(f"\n[*] split        : {len(idx) - n_valid} train / {n_valid} valid frame(s) "
+                  f"({n_valid / len(idx):.1%}), held out by compound")
+            for c in sorted(idx.loc[idx["split"] == "valid", "comp"].unique()):
+                f = idx.loc[idx["comp"] == c, "formula"].iloc[0]
+                print(f"[*]   valid: {c}  ({f}, {int((idx['comp'] == c).sum())} frames)")
+            if n_valid == 0:
+                print("[!]   nothing was held out -- too few compounds for this fraction")
+            elif n_valid == len(idx):
+                sys.exit("[ERROR] every compound went to validation; lower --valid-frac")
+
+        splits = ([("train", idx[idx["split"] == "train"]),
+                   ("valid", idx[idx["split"] == "valid"])]
+                  if args.valid_frac > 0 else [("", idx)])
+
     idx_path = os.path.join(args.out, "dataset_index.csv")
     if args.dry_run:
         print(f"\n[dry-run] would write "
@@ -605,6 +660,16 @@ def main(argv=None):
                   f"{d} atoms")
 
     idx.to_csv(idx_path, index=False)
+    if args.kfold:
+        folds = fold_manifest(args.out, args.kfold)
+        for k in range(args.kfold):
+            folds[f"fold_{k}"]["valid_compounds"] = \
+                sorted(idx.loc[idx["fold"] == k, "comp"].unique())
+        folds_path = os.path.join(args.out, "folds.json")
+        with open(folds_path, "w") as fh:
+            json.dump(folds, fh, indent=2)
+        print(f"\n[*] folds -> {folds_path}   (the systems lists for each of the "
+              f"{args.kfold} runs)")
     print(f"\n[*] index -> {idx_path}   (a 'split' column records which side each frame "
           f"went to)")
     print(f"[*] fparam is [P_high(atm), P_low(atm), T({args.t_unit})]"
@@ -612,7 +677,14 @@ def main(argv=None):
           f"label file is {args.label_name}.npy")
     print(f"[*] set property_name = {args.label_name!r} and numb_fparam = 3 in the "
           f"deepmd input.json, with")
-    if args.valid_frac > 0:
+    if args.kfold:
+        print(f"[*] each fold is written once; run {args.kfold} trainings, fold k using")
+        print(f"[*]   validation_data.systems = [{os.path.join(args.out, 'fold_k')}/*]")
+        print(f"[*]   training_data.systems   = the other {args.kfold - 1} fold globs "
+              f"(see folds.json)")
+        print(f"[*] average the {args.kfold} validation scores; every compound is "
+              f"held out exactly once")
+    elif args.valid_frac > 0:
         print(f"[*]   training_data.systems   = {os.path.join(args.out, 'train')}/*")
         print(f"[*]   validation_data.systems = {os.path.join(args.out, 'valid')}/*")
     else:
