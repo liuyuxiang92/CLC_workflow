@@ -53,6 +53,19 @@ swallowing it) is what lets a systematic problem (wrong GPU target, bad
 model path) surface instead of silently reporting a meaningless reward. A
 skipped realization still cost real MD time; this is about not letting one
 bad roll crash an entire training run, not about making failures free.
+
+``md_debug_dir`` (optional, top-level config key like ``md_keep_scratch`` /
+``md_scratch_root``): when set, every realization's pre-relax (MD-averaged)
+and post-relax structure is written there as a POSCAR
+(``00007_md_avg.vasp`` / ``00007_opt_converged.vasp`` or
+``00007_opt_UNCONVERGED_fmax0.1432.vasp`` — same index, so the pair sorts
+together), for visual inspection (e.g. in VESTA) when the optimizer isn't
+converging or a structure looks physically unreasonable. Convergence is
+determined from the ASE calculator's cached forces on the returned
+structure (no extra DP call), since ``relax_structure`` itself only prints
+on non-convergence rather than returning a status. Off by default — meant
+for a small diagnostic run, not left on through a full training run (one
+pair of files per realization, every episode).
 """
 from __future__ import annotations
 
@@ -123,6 +136,16 @@ class MDAveragedOptBuilder:
 
         self.keep_scratch: bool = bool(cfg.get("md_keep_scratch", False))
         self.scratch_root: Optional[str] = cfg.get("md_scratch_root")
+        # Debugging aid: write the pre-relax (MD-averaged) and post-relax structure
+        # to disk for every realization, as POSCARs, so a human can inspect them
+        # (e.g. in VESTA) when the optimizer isn't converging or a structure looks
+        # unreasonable. Off by default -- meant for a small diagnostic run, not left
+        # on through a full multi-thousand-episode training run (one pair of files
+        # per realization, every episode).
+        self.debug_dir: Optional[str] = cfg.get("md_debug_dir")
+        if self.debug_dir:
+            os.makedirs(self.debug_dir, exist_ok=True)
+        self._debug_counter = 0
         self._geo_calc = None  # lazily built, reused across calls (avoid reloading the model)
 
     # ------------------------------------------------------------------
@@ -173,6 +196,22 @@ class MDAveragedOptBuilder:
         return fn(candidate) if callable(fn) else None
 
     # ------------------------------------------------------------------
+
+    def _save_debug_structure(self, atoms: "ase.Atoms", *, index: int, tag: str) -> None:
+        """Write *atoms* to ``md_debug_dir`` as a POSCAR, named so the pre-relax
+        (``md_avg``) and post-relax (``opt_converged`` / ``opt_UNCONVERGED_fmax...``)
+        files for the same realization share the same index and sort together.
+        """
+        from pymatgen.io.ase import AseAtomsAdaptor
+        from pymatgen.io.vasp import Poscar
+
+        structure = AseAtomsAdaptor.get_structure(atoms)
+        path = os.path.join(self.debug_dir, f"{index:05d}_{tag}.vasp")
+        Poscar(
+            structure.get_sorted_structure(),
+            comment=f"{tag} -- rl_builder debug dump, realization {index}",
+        ).write_file(path)
+        print(f"[rl_builder] wrote debug structure: {path}")
 
     @staticmethod
     def _check_structure(structure, min_dist: float) -> None:
@@ -287,6 +326,12 @@ class MDAveragedOptBuilder:
                 pbc=True,
             )
 
+            debug_idx = None
+            if self.debug_dir:
+                self._debug_counter += 1
+                debug_idx = self._debug_counter
+                self._save_debug_structure(averaged, index=debug_idx, tag="md_avg")
+
             from rl_matdesign.utils.structure import relax_structure
 
             if self._geo_calc is None:
@@ -296,13 +341,26 @@ class MDAveragedOptBuilder:
                 self._geo_calc = DPCalculator(
                     model=self.opt["model"], **({"head": head} if head else {})
                 )
-            return relax_structure(
+            fmax_target = float(self.opt.get("fmax", 0.01))
+            optimized = relax_structure(
                 averaged,
                 calc=self._geo_calc,
-                fmax=float(self.opt.get("fmax", 0.01)),
+                fmax=fmax_target,
                 steps=int(self.opt.get("steps", 2000)),
                 relax_cell=bool(self.opt.get("relax_cell", True)),
             )
+
+            if self.debug_dir:
+                # optimized still carries its calculator, and its position/cell match
+                # what LBFGS last evaluated -- get_forces() returns the cached result
+                # (no extra DP call) rather than re-running the model.
+                forces = optimized.get_forces()
+                final_fmax = float((forces ** 2).sum(axis=1).max() ** 0.5)
+                converged = final_fmax <= fmax_target
+                tag = "opt_converged" if converged else f"opt_UNCONVERGED_fmax{final_fmax:.4f}"
+                self._save_debug_structure(optimized, index=debug_idx, tag=tag)
+
+            return optimized
         except BaseException:
             # The failure messages above name `scratch` so the deck, conf.lmp and the
             # partial trajectory can be inspected -- deleting it here would make every
