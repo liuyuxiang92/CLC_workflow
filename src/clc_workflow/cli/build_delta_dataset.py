@@ -625,6 +625,7 @@ def main(argv=None):
     import dpdata
 
     os.makedirs(args.out, exist_ok=True)
+    systems_of = {}
     for name, part in splits:
         if part.empty:
             continue
@@ -650,18 +651,22 @@ def main(argv=None):
         ms.to_deepmd_npy_mixed(dest, set_size=args.set_size)
 
         print(f"\n[*] wrote {len(part)} frame(s) to {dest}/ (deepmd/npy/mixed)")
+        written = []
         for d in sorted(os.listdir(dest)):
             sub = os.path.join(dest, d)
             if not os.path.isdir(sub) or not d.isdigit():
                 continue
+            written.append(sub)
             nf = sum(np.load(os.path.join(sub, s, "coord.npy")).shape[0]
                      for s in sorted(os.listdir(sub)) if s.startswith("set."))
             print(f"[*]   {os.path.join(name, d) if name else d}/  {nf} frame(s), "
                   f"{d} atoms")
+        systems_of[name] = written
 
     idx.to_csv(idx_path, index=False)
     if args.kfold:
-        folds = fold_manifest(args.out, args.kfold)
+        folds = fold_manifest(args.out, args.kfold,
+                              {k: systems_of.get(f"fold_{k}", []) for k in range(args.kfold)})
         for k in range(args.kfold):
             folds[f"fold_{k}"]["valid_compounds"] = \
                 sorted(idx.loc[idx["fold"] == k, "comp"].unique())
@@ -678,12 +683,10 @@ def main(argv=None):
     print(f"[*] set property_name = {args.label_name!r} and numb_fparam = 3 in the "
           f"deepmd input.json, with")
     if args.kfold:
-        print(f"[*] each fold is written once; run {args.kfold} trainings, fold k using")
-        print(f"[*]   validation_data.systems = [{os.path.join(args.out, 'fold_k')}/*]")
-        print(f"[*]   training_data.systems   = the other {args.kfold - 1} fold globs "
-              f"(see folds.json)")
-        print(f"[*] average the {args.kfold} validation scores; every compound is "
-              f"held out exactly once")
+        print(f"[*] each fold is written once; run {args.kfold} trainings, taking fold k's")
+        print(f"[*]   validation_data.systems and training_data.systems from folds.json")
+        print(f"[*] average the {args.kfold} validation scores, weighted by fold size; "
+              f"every compound is held out exactly once")
     elif args.valid_frac > 0:
         print(f"[*]   training_data.systems   = {os.path.join(args.out, 'train')}/*")
         print(f"[*]   validation_data.systems = {os.path.join(args.out, 'valid')}/*")

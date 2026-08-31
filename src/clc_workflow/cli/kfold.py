@@ -10,6 +10,12 @@ This does it to a dataset that already exists, which is what you want when the d
 expensive to build, when it came from somewhere else entirely, or when you started with one
 train/valid split and now want K.
 
+SYSTEMS ARE NAMED BY THEIR PATH under their own dataset, minus a leading train/ or valid/.
+A mixed-type dataset names its systems after the atom count, so `train/1_scfm/320` and
+`train/34_scfc_sbfc/320` are both called `320` while holding different species; the path
+keeps them apart, and dropping the split component is what lets `train/1_scfm/320` and
+`valid/1_scfm/320` come back together as one system.  The output mirrors that tree.
+
 POINT IT AT THE PARENT OF AN EXISTING SPLIT.  `clc kfold delta_dataset` finds the systems
 under `train/` and `valid/` alike and deals all of them out fresh -- the old split is
 undone, not folded into the new one.  Give the two directories separately and you get the
@@ -24,7 +30,9 @@ probably do not want it.
 
 Each fold is written once, as fold_0/ ... fold_{K-1}/ -- disjoint, no duplication on disk.
 A fold's training set is the other K-1 directories; folds.json lists both sides for each of
-the K runs, and fold_index.csv records where every frame came from and where it went.
+the K runs -- naming the system directories one by one, since a system can sit more than one
+level down and a `fold_k/*` glob would then resolve to something that is not a system --
+and fold_index.csv records where every frame came from and where it went.
 
 The arrays are sliced and the raw files copied verbatim, so whatever the dataset carries --
 fparam, delta, energy, force, an array added later -- comes through untouched.
@@ -38,7 +46,7 @@ from collections import Counter, defaultdict
 import numpy as np
 
 from clc_workflow.kfold import (assign_folds, find_systems, fold_manifest, frame_groups,
-                                load_system, write_system)
+                                load_system, system_name, write_system)
 
 
 def main(argv=None):
@@ -81,29 +89,32 @@ def main(argv=None):
           + ", ".join(f"{ds} ({sum(1 for d, _ in systems if d == ds)} system(s))"
                       for ds in args.dataset))
 
-    # Systems from different inputs merge when they carry the same name and the same raw
-    # files -- which is exactly the train/40 + valid/40 case, two halves of one system.
-    # A shared name over different raws is a genuine collision and is not silently merged.
-    loaded, order, raws_of, sig_of = {}, [], {}, {}
+    # A system is named by its path under its own dataset, minus a leading train/ or
+    # valid/ -- so the two halves of an existing split merge, while two subsets that both
+    # name a system after the same atom count stay apart.  A name shared over different
+    # raw files is a genuine collision and is not silently merged.
+    loaded, order, raws_of, sig_of, first_of = {}, [], {}, {}, {}
     total = 0
     for ds, sysdir in systems:
         arrays, raws, n = load_system(sysdir)
-        name = os.path.basename(sysdir)
+        name = system_name(ds, sysdir)
         sig = tuple(sorted((f, open(p, "rb").read()) for f, p in raws.items()))
         if name in sig_of and sig_of[name] != sig:
             sys.exit(f"[ERROR] two systems are both named {name!r} but carry different "
-                     f"type.raw/type_map.raw:\n        {sysdir}\n        and an earlier "
-                     f"one.  Pooling them would mix two different systems under one name; "
-                     f"rename one, or fold them separately")
+                     f"type.raw/type_map.raw:\n        {first_of[name]}\n"
+                     f"        {sysdir}\n"
+                     f"        Pooling them would mix two different systems under one "
+                     f"name; rename one, or fold them separately")
         if name not in loaded:
             order.append(name)
             loaded[name] = defaultdict(list)
-            raws_of[name], sig_of[name] = raws, sig
+            raws_of[name], sig_of[name], first_of[name] = raws, sig, sysdir
         for key, a in arrays.items():
             loaded[name][key].append(a)
         total += n
-        print(f"[*]   {os.path.relpath(sysdir, ds)}  {n} frame(s), "
-              f"{', '.join(sorted(arrays))}")
+        rel = os.path.relpath(sysdir, ds)
+        merged = f"  ->  {name}" if rel != name else ""
+        print(f"[*]   {rel}{merged}  {n} frame(s), {', '.join(sorted(arrays))}")
 
     pooled = {name: {k: np.concatenate(v, axis=0) for k, v in sorted(loaded[name].items())}
               for name in order}
@@ -157,21 +168,23 @@ def main(argv=None):
 
     # ---- write ----------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
-    index = []
+    index, systems_of = [], defaultdict(list)
     for f in range(args.kfold):
         dest_root = os.path.join(args.out, f"fold_{f}")
         for name in order:
             take = fold_rows[f].get(name)
             if not take:
                 continue
-            write_system(os.path.join(dest_root, name), pooled[name], raws_of[name],
-                         take, args.set_size)
+            dest = os.path.join(dest_root, name)
+            write_system(dest, pooled[name], raws_of[name], take, args.set_size)
+            systems_of[f].append(dest)
             for pos, i in enumerate(take):
                 index.append({"fold": f, "system": name, "src_frame": i,
                               "fold_frame": pos})
-        print(f"[*] wrote {per_fold[f]} frame(s) to {dest_root}/")
+        print(f"[*] wrote {per_fold[f]} frame(s) to {dest_root}/ "
+              f"({len(systems_of[f])} system(s))")
 
-    folds = fold_manifest(args.out, args.kfold)
+    folds = fold_manifest(args.out, args.kfold, systems_of)
     for f in range(args.kfold):
         folds[f"fold_{f}"]["n_valid_frames"] = per_fold[f]
         folds[f"fold_{f}"]["n_train_frames"] = total - per_fold[f]
@@ -188,10 +201,13 @@ def main(argv=None):
     print(f"\n[*] folds -> {folds_path}   (the systems lists for each of the "
           f"{args.kfold} runs)")
     print(f"[*] index -> {idx_path}   (which pooled frame went to which fold)")
-    print(f"[*] each fold is written once; run {args.kfold} trainings, fold k using")
-    print(f"[*]   validation_data.systems = [{os.path.join(args.out, 'fold_k')}/*]")
-    print(f"[*]   training_data.systems   = the other {args.kfold - 1} fold globs "
-          f"(see folds.json)")
+    print(f"[*] each fold is written once; run {args.kfold} trainings, fold k taking its")
+    print(f"[*]   validation_data.systems and training_data.systems straight from "
+          f"folds.json")
+    print(f"[*]   (the system directories are listed one by one -- a fold is not a "
+          f"system, so a")
+    print(f"[*]    {os.path.join(args.out, 'fold_k')}/* glob would not resolve to one "
+          f"at every layout)")
     print(f"[*] average the {args.kfold} validation scores; every group is held out "
           f"exactly once")
 
