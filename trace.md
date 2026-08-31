@@ -467,3 +467,46 @@ infra/install issue, not something fixable from rl-matdesign/CLC_workflow config
 Added `md.env` (dict) support to MDAveragedOptBuilder's subprocess.run call so the
 user can set DP_BACKEND_PLUGIN_PATH/LD_LIBRARY_PATH etc. via YAML rather than
 relying on shell env persisting into a detached/nohup training run.
+
+### EARS — Session (2026-08-31)
+<!-- concepts: cross-validation-splits, dpdata-npy-format, cli-design -->
+- Task: add K-fold cross-validation to the property-training datasets — first
+  `clc delta --kfold K` at build time, then `clc kfold` to fold a dpdata set that
+  already exists.
+- Why: one 10% held-out set is a handful of compounds, and the score it reports swings
+  with which ones they happen to be. Rotating five held-out sets uses every compound as
+  validation exactly once.
+- **The split has to be group K-fold, and the group is the compound.** A compound
+  contributes every temperature, every pressure window and every SQS realisation as
+  separate frames that share a label and differ only in `fparam`. Plain K-fold over
+  frames would train four folds out of five on a near-duplicate of what they are scored
+  on. This is the same rule the existing `--valid-frac` split already followed; K-fold
+  just applies it K times.
+- **Balance folds on frames, not on group count.** Groups carry very different frame
+  counts, so round-robin over compounds leaves the K validation scores measuring
+  different amounts of data. Greedy longest-first packing into the lightest fold. Perfect
+  balance is unreachable — 7 compounds into 5 folds gives 24/24/12/12/12, because a fold
+  cannot hold half a compound. Consequence for the user: weight the K scores by
+  `n_valid_frames` rather than taking a plain mean.
+- **Slice the .npy files rather than round-tripping through dpdata.** Reading a dataset
+  back through dpdata means registering every extra array first (`fparam`, `delta`, and
+  whatever a later dataset adds) and silently dropping the ones it was not told about. A
+  deepmd/npy system is per-frame arrays stacked on axis 0 plus a few raw files, so
+  slicing the arrays and copying the raws preserves the dataset exactly — verified
+  byte-identical on both a mixed-type `fparam`+`delta` set and a plain energy/force one.
+  This also made the code format-agnostic for free.
+- **Composition recovers the compound grouping from the data alone.** Every SQS
+  realisation and every measurement of one composition has the same atom counts, so
+  grouping on the species multiset from `real_atom_types.npy` reproduces exactly the
+  by-compound partition — no manifest, no `dataset_index.csv`, no fragile join between
+  index rows and on-disk frame order. Checked against `dataset_index.csv`: 7 groups, 7
+  compounds.
+- Write each fold once as `fold_k/` and let a fold's training set be the other K-1
+  directories, listed in `folds.json`. Writing `fold_k/{train,valid}/` instead would put
+  every frame on disk K-1 times for no gain.
+- **Testing pitfall, cost me a bogus failure report**: a smoke loop of
+  `for a in "--out A" ...; do clc delta ... $a; done` — zsh does not word-split unquoted
+  `$a`, so each whole string arrived as one argv entry and every case "failed". Short
+  options survived it (`-k 5` parses as `-k` with value `" 5"`), which made the failure
+  pattern look real rather than like a quoting bug. Use a `run() { "$@"; }` helper for
+  parameterised CLI smoke tests in zsh.
