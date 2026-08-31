@@ -74,6 +74,35 @@ def find_systems(root):
     return sorted(found)
 
 
+# Directory names that mean "this is one side of a split", not "this is a system".
+SPLIT_DIRS = {"train", "training", "valid", "validation", "test", "eval"}
+
+
+def system_name(root, sysdir):
+    """
+    What to call a system once it is pooled: its path under its own dataset root, with a
+    leading train/ or valid/ dropped.
+
+    The basename alone is not enough.  A mixed-type dataset names its systems after the
+    atom count, so `train/1_scfm/320` and `train/34_scfc_sbfc/320` are both called `320`
+    while being different systems over different species -- pooling those under one name
+    would mix them.  The path keeps them apart and keeps the tree recognisable in the
+    output.
+
+    The split component is dropped so that `train/1_scfm/320` and `valid/1_scfm/320` --
+    two halves of one system, which is exactly what an existing split looks like -- come
+    back together instead of being carried through as two systems that happen to hold the
+    same species.
+    """
+    rel = os.path.relpath(os.path.abspath(sysdir), os.path.abspath(root))
+    if rel in (".", ""):
+        return os.path.basename(os.path.abspath(sysdir))
+    parts = [p for p in rel.split(os.sep) if p not in (".",)]
+    if len(parts) > 1 and parts[0].lower() in SPLIT_DIRS:
+        parts = parts[1:]
+    return "/".join(parts)
+
+
 def load_system(sysdir):
     """
     One system -> (per-frame arrays concatenated over its sets, raw files, n_frames).
@@ -181,6 +210,7 @@ def frame_groups(arrays, raws, how, sysname):
 
 def write_system(dest, arrays, raws, rows, set_size):
     """Write the frames `rows` of one system to `dest`, keeping every array it carries."""
+    dest = os.path.join(*dest.split("/")) if os.sep != "/" else dest
     os.makedirs(dest, exist_ok=True)
     for name, src in raws.items():
         shutil.copyfile(src, os.path.join(dest, name))
@@ -194,9 +224,20 @@ def write_system(dest, arrays, raws, rows, set_size):
     return len(rows)
 
 
-def fold_manifest(out, k):
-    """The train/valid systems lists for each of the K runs, as they go into folds.json."""
+def fold_manifest(out, k, systems_of):
+    """
+    The train/valid systems lists for each of the K runs, as they go into folds.json.
+
+    `systems_of` is {fold: [system directories written there]} and the directories are
+    listed one by one rather than collapsed to `fold_k/*`.  A system's name can carry
+    subdirectories -- a dataset laid out as <subset>/<atom count> puts its systems two
+    levels down -- and there a one-star glob resolves to the subset directories, which
+    hold no type.raw and are not systems at all.  Listing them is exact at any depth.
+    """
+    def dirs(i):
+        return sorted(systems_of.get(i, []))
+
     return {f"fold_{i}": {
-        "training_data": [os.path.join(out, f"fold_{j}", "*") for j in range(k) if j != i],
-        "validation_data": [os.path.join(out, f"fold_{i}", "*")],
+        "training_data": [p for j in range(k) if j != i for p in dirs(j)],
+        "validation_data": dirs(i),
     } for i in range(k)}
