@@ -2,8 +2,9 @@
 """
 Lay out one training task per fold: data/task.000y/{train,valid}/iter_x/fold_n.
 
-    clc tasks <root> [--out data] [--input-template input.json] [--model ckpt.pt]
-                     [--copy] [--dry-run]
+    clc tasks <root> [--out data] [--iters ... | --upto iter_N]
+                     [--input-template input.json] [--model ckpt.pt]
+                     [--task-model 'prev/task.{task}/model.ckpt.pt'] [--copy] [--dry-run]
 
 <root> holds the folds, either directly or one iteration deep:
 
@@ -26,10 +27,21 @@ where each piece came from, and two iterations contributing the same fold index 
 collide.  Each fold is one link to the original directory; `--copy` writes real copies, for
 a filesystem where the training job cannot follow a link.
 
-`--model` copies a pretrained checkpoint into every task, so each run fine-tunes from its
-own copy and writes its checkpoints beside it.  Copied rather than linked on purpose: five
-runs sharing one file would be five runs writing over each other's output the moment any
-of them saves next to it.
+ROUND N TRAINS ON ITERATIONS 1..N.  `--upto iter_2` selects iter_1 and iter_2 and leaves
+later rounds out; `--iters` names them outright.  Each round is a fresh K-fold over the
+data collected so far, which is why the fold directories are re-read every time rather
+than a previous round's tasks being extended.
+
+`--model` copies one pretrained checkpoint into every task.  `--task-model` gives each task
+its own, which is what chains the rounds: fold k of round N continues from the model fold k
+produced in round N-1, and never from a model that has already trained on fold k's data.
+Point it at the previous round with a pattern --
+
+    clc tasks . --upto iter_2 --out data_iter2 \
+                --task-model 'data_iter1/task.{task}/model.ckpt.pt'
+
+Models are copied rather than linked on purpose: runs sharing one file would write over
+each other's output the moment any of them saves beside it.
 
 PASS THE SYSTEMS EXPLICITLY, not the parent directory.  Every task writes systems.json
 naming its system directories one by one, and `--input-template` fills a copy of your
@@ -38,6 +50,7 @@ nothing: a directory walk does not descend into a symlink, so the training set w
 back empty with nothing obviously wrong.
 """
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -49,6 +62,11 @@ import numpy as np
 from clc_workflow.kfold import find_systems
 
 _FOLD = re.compile(r"^fold[_-]?(\d+)$")
+
+
+def natural(name):
+    """Sort key that reads embedded numbers as numbers, so iter_10 follows iter_9."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
 
 def discover(root, exclude=()):
@@ -139,11 +157,26 @@ def main(argv=None):
     ap.add_argument("--input-template", default=None,
                     help="an input.json to copy into every task with its "
                          "training_data.systems and validation_data.systems filled in")
+    ap.add_argument("--iters", nargs="+", default=None,
+                    help="iterations to include, by name or glob (iter_1 iter_2, or "
+                         "'iter_[12]').  The default is every iteration under the root")
+    ap.add_argument("--upto", default=None,
+                    help="include every iteration up to and including this one, in "
+                         "natural order -- the cumulative form: --upto iter_2 trains on "
+                         "iter_1 + iter_2")
+    ap.add_argument("--task-model", nargs="+", default=None,
+                    help="a DIFFERENT model per task, for chaining rounds: each fold "
+                         "continues from the model that same fold produced last round.  "
+                         "Either one path per task in order, or a single pattern with "
+                         "{task} (the zero-padded number), {y} (the index) or {fold} "
+                         "(the fold index), e.g. "
+                         "'data_iter1/task.{task}/model.ckpt.pt'")
     ap.add_argument("--model", nargs="+", default=None,
-                    help="file(s) to copy into every task directory -- the pretrained "
-                         "checkpoint to fine-tune from, and anything else each run needs "
-                         "beside it.  Copied, not linked: a run that writes next to its "
-                         "model must not write into the others")
+                    help="file(s) copied into EVERY task directory -- the shared "
+                         "pretrained checkpoint, and anything else each run needs beside "
+                         "it.  Copied, not linked: a run that writes next to its model "
+                         "must not write into the others.  Use --task-model when the "
+                         "tasks need different models")
     ap.add_argument("--copy", action="store_true",
                     help="copy the fold directories instead of symlinking them")
     ap.add_argument("--dry-run", action="store_true",
@@ -158,8 +191,38 @@ def main(argv=None):
                  f"fold_1, ... either directly under it or one level down "
                  f"(iter_1/fold_0, ...)")
 
+    if args.iters and args.upto:
+        sys.exit("[ERROR] --iters lists the iterations outright and --upto takes every "
+                 "one through a given name.  Use one or the other")
+
+    available = sorted({it for e in folds.values() for it, _, _, _ in e}, key=natural)
+    if args.iters or args.upto:
+        if args.upto:
+            if args.upto not in available:
+                sys.exit(f"[ERROR] --upto {args.upto!r} is not an iteration under "
+                         f"{args.root}; it has "
+                         f"{[a or '<root>' for a in available]}")
+            cut = available.index(args.upto)
+            wanted = set(available[:cut + 1])
+            print(f"[*] selection    : --upto {args.upto} -> "
+                  f"{', '.join(available[:cut + 1])}")
+        else:
+            wanted = {a for a in available
+                      if any(fnmatch.fnmatch(a, pat) for pat in args.iters)}
+            unmatched = [pat for pat in args.iters
+                         if not any(fnmatch.fnmatch(a, pat) for a in available)]
+            if unmatched:
+                sys.exit(f"[ERROR] --iters {unmatched} matched no iteration; the root "
+                         f"has {[a or '<root>' for a in available]}")
+            print(f"[*] selection    : --iters -> "
+                  f"{', '.join(sorted(wanted, key=natural))}")
+        folds = {k: [e for e in v if e[0] in wanted] for k, v in folds.items()}
+        folds = {k: v for k, v in folds.items() if v}
+        if not folds:
+            sys.exit("[ERROR] the selected iterations hold no folds")
+
     order = sorted(folds)
-    iterations = sorted({it for e in folds.values() for it, _, _, _ in e})
+    iterations = sorted({it for e in folds.values() for it, _, _, _ in e}, key=natural)
     print(f"[*] root         : {os.path.abspath(args.root)}")
     print(f"[*] folds        : {len(order)} ({', '.join('fold_%d' % k for k in order)})")
     print(f"[*] iterations   : {len(iterations)} "
@@ -191,6 +254,31 @@ def main(argv=None):
         if not os.path.exists(m):
             sys.exit(f"[ERROR] no such model file: {m}")
         models.append(os.path.abspath(m))
+
+    # One model per task, either spelled out in task order or generated from a pattern.
+    # Resolved and checked here, before any directory is made, so a wrong pattern fails
+    # with the paths it tried rather than leaving a half-built tree behind.
+    task_models = {}
+    if args.task_model:
+        spec = args.task_model
+        if len(spec) == 1 and "{" in spec[0]:
+            want = {y: spec[0].format(task=f"{y:0{args.width}d}", y=y, fold=k)
+                    for y, k in enumerate(order)}
+        elif len(spec) == len(order):
+            want = dict(enumerate(spec))
+        else:
+            sys.exit(f"[ERROR] --task-model was given {len(spec)} path(s) for "
+                     f"{len(order)} task(s).\n"
+                     f"        Give one per task in order, or a single pattern "
+                     f"containing {{task}}, {{y}} or {{fold}}.")
+        missing = {y: p for y, p in want.items() if not os.path.exists(p)}
+        if missing:
+            sys.exit("[ERROR] --task-model resolved to paths that do not exist:\n"
+                     + "\n".join(f"        task {y:0{args.width}d} -> {p}"
+                                 for y, p in sorted(missing.items())))
+        task_models = {y: os.path.abspath(p) for y, p in want.items()}
+        print(f"[*] task model   : one per task, e.g. task {0:0{args.width}d} -> "
+              f"{os.path.relpath(task_models[0])}")
     if models:
         print(f"[*] model        : "
               + ", ".join(f"{os.path.basename(m)} "
@@ -207,12 +295,15 @@ def main(argv=None):
         print(f"[*]   {task}: valid = fold_{k} ({frames[k]} frame(s)), "
               f"train = {', '.join('fold_%d' % j for j in order if j != k)} "
               f"({total - frames[k]} frame(s))")
-        plan.append((task, tr, folds[k], k))
+        plan.append((task, tr, folds[k], k, y))
 
     if args.dry_run:
         if models:
             print(f"[*]   each with a copy of "
                   f"{', '.join(os.path.basename(m) for m in models)}")
+        for y in sorted(task_models):
+            print(f"[*]   task {y:0{args.width}d} also gets "
+                  f"{os.path.relpath(task_models[y])}")
         print("\n[dry-run] nothing written.")
         return
 
@@ -227,14 +318,14 @@ def main(argv=None):
                 print(f"[warn] {args.input_template}: training.{key} is absent; "
                       f"it will be created")
 
-    for task, tr, va, k in plan:
+    for task, tr, va, k, y in plan:
         os.makedirs(task, exist_ok=True)
         tr_paths = place(os.path.join(task, "train"), tr, args.copy)
         va_paths = place(os.path.join(task, "valid"), va, args.copy)
         with open(os.path.join(task, "systems.json"), "w") as fh:
             json.dump({"fold": k, "training_data": tr_paths,
                        "validation_data": va_paths}, fh, indent=2)
-        for m in models:
+        for m in models + ([task_models[y]] if y in task_models else []):
             target = os.path.join(task, os.path.basename(m))
             if os.path.islink(target):
                 os.unlink(target)
@@ -252,8 +343,9 @@ def main(argv=None):
             cfg["training"]["validation_data"]["systems"] = va_paths
             with open(os.path.join(task, "input.json"), "w") as fh:
                 json.dump(cfg, fh, indent=2)
+        n_models = len(models) + (1 if y in task_models else 0)
         extra = "".join([", input.json" if template is not None else "",
-                         f", {len(models)} model file(s)" if models else ""])
+                         f", {n_models} model file(s)" if n_models else ""])
         print(f"[*] wrote {task}/  train: {len(tr_paths)} system(s), "
               f"valid: {len(va_paths)} system(s){extra}")
 
@@ -271,8 +363,13 @@ def main(argv=None):
     if template is None:
         print(f"[*] --input-template input.json would also write a filled-in input.json "
               f"per task")
-    if not models:
-        print(f"[*] --model <checkpoint> would copy a pretrained model into every task")
+    if task_models:
+        print(f"[*] each task also carries its own model, so fold k continues from what "
+              f"fold k\n[*]   produced last round rather than from a model that has "
+              f"already seen fold k")
+    if not models and not task_models:
+        print(f"[*] --model <checkpoint> copies one model into every task; --task-model "
+              f"gives\n[*]   each task its own, for chaining rounds")
 
 
 if __name__ == "__main__":
