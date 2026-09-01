@@ -213,7 +213,11 @@ def write_system(dest, arrays, raws, rows, set_size):
     dest = os.path.join(*dest.split("/")) if os.sep != "/" else dest
     os.makedirs(dest, exist_ok=True)
     for name, src in raws.items():
-        shutil.copyfile(src, os.path.join(dest, name))
+        dst = os.path.join(dest, name)
+        # A caller that built its raws in place -- `clc decorate` writes type.raw straight
+        # into the system directory -- hands us a source that already IS the destination.
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
     rows = np.asarray(rows, dtype=int)
     for i, start in enumerate(range(0, len(rows), set_size)):
         sd = os.path.join(dest, "set.%03d" % i)
