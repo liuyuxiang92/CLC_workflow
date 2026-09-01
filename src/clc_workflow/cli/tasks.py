@@ -2,7 +2,8 @@
 """
 Lay out one training task per fold: data/task.000y/{train,valid}/iter_x/fold_n.
 
-    clc tasks <root> [--out data] [--input-template input.json] [--copy] [--dry-run]
+    clc tasks <root> [--out data] [--input-template input.json] [--model ckpt.pt]
+                     [--copy] [--dry-run]
 
 <root> holds the folds, either directly or one iteration deep:
 
@@ -24,6 +25,11 @@ The iteration and fold names are kept rather than flattened, so a task directory
 where each piece came from, and two iterations contributing the same fold index cannot
 collide.  Each fold is one link to the original directory; `--copy` writes real copies, for
 a filesystem where the training job cannot follow a link.
+
+`--model` copies a pretrained checkpoint into every task, so each run fine-tunes from its
+own copy and writes its checkpoints beside it.  Copied rather than linked on purpose: five
+runs sharing one file would be five runs writing over each other's output the moment any
+of them saves next to it.
 
 PASS THE SYSTEMS EXPLICITLY, not the parent directory.  Every task writes systems.json
 naming its system directories one by one, and `--input-template` fills a copy of your
@@ -133,6 +139,11 @@ def main(argv=None):
     ap.add_argument("--input-template", default=None,
                     help="an input.json to copy into every task with its "
                          "training_data.systems and validation_data.systems filled in")
+    ap.add_argument("--model", nargs="+", default=None,
+                    help="file(s) to copy into every task directory -- the pretrained "
+                         "checkpoint to fine-tune from, and anything else each run needs "
+                         "beside it.  Copied, not linked: a run that writes next to its "
+                         "model must not write into the others")
     ap.add_argument("--copy", action="store_true",
                     help="copy the fold directories instead of symlinking them")
     ap.add_argument("--dry-run", action="store_true",
@@ -175,6 +186,18 @@ def main(argv=None):
         print("[!] the K validation sets are then not drawn alike; check this is "
               "what you meant")
 
+    models = []
+    for m in (args.model or []):
+        if not os.path.exists(m):
+            sys.exit(f"[ERROR] no such model file: {m}")
+        models.append(os.path.abspath(m))
+    if models:
+        print(f"[*] model        : "
+              + ", ".join(f"{os.path.basename(m)} "
+                          f"({os.path.getsize(m) / 1e6:.1f} MB)" if os.path.isfile(m)
+                          else f"{os.path.basename(m)}/ (directory)" for m in models)
+              + " -> copied into every task")
+
     total = sum(frames.values())
     print(f"\n[*] tasks        : {len(order)}, {total} frame(s) in all")
     plan = []
@@ -187,6 +210,9 @@ def main(argv=None):
         plan.append((task, tr, folds[k], k))
 
     if args.dry_run:
+        if models:
+            print(f"[*]   each with a copy of "
+                  f"{', '.join(os.path.basename(m) for m in models)}")
         print("\n[dry-run] nothing written.")
         return
 
@@ -208,6 +234,16 @@ def main(argv=None):
         with open(os.path.join(task, "systems.json"), "w") as fh:
             json.dump({"fold": k, "training_data": tr_paths,
                        "validation_data": va_paths}, fh, indent=2)
+        for m in models:
+            target = os.path.join(task, os.path.basename(m))
+            if os.path.islink(target):
+                os.unlink(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
+            if os.path.isdir(m):
+                shutil.copytree(m, target)
+            else:
+                shutil.copyfile(m, target)
         if template is not None:
             cfg = json.loads(json.dumps(template))
             cfg.setdefault("training", {}).setdefault("training_data", {})
@@ -216,9 +252,10 @@ def main(argv=None):
             cfg["training"]["validation_data"]["systems"] = va_paths
             with open(os.path.join(task, "input.json"), "w") as fh:
                 json.dump(cfg, fh, indent=2)
+        extra = "".join([", input.json" if template is not None else "",
+                         f", {len(models)} model file(s)" if models else ""])
         print(f"[*] wrote {task}/  train: {len(tr_paths)} system(s), "
-              f"valid: {len(va_paths)} system(s)"
-              f"{', input.json' if template is not None else ''}")
+              f"valid: {len(va_paths)} system(s){extra}")
 
     how = "copies of" if args.copy else "symlinks to"
     print(f"\n[*] each task holds {how} the fold directories under train/<iter>/ and "
@@ -226,9 +263,16 @@ def main(argv=None):
     print(f"[*]   and systems.json names the system directories one by one -- give "
           f"deepmd that")
     print(f"[*]   list, not the parent, since a tree walk does not descend into a symlink")
+    if models:
+        print(f"[*] each task carries its own copy of "
+              f"{', '.join(os.path.basename(m) for m in models)}, so a run can "
+              f"fine-tune\n[*]   from it and write its checkpoints beside it without "
+              f"touching the other tasks")
     if template is None:
         print(f"[*] --input-template input.json would also write a filled-in input.json "
               f"per task")
+    if not models:
+        print(f"[*] --model <checkpoint> would copy a pretrained model into every task")
 
 
 if __name__ == "__main__":
