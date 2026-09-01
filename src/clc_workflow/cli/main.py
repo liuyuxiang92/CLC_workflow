@@ -36,6 +36,7 @@ COMMANDS = {
     "delta":    ("build_delta_dataset", "build the measured-vs-computed delta dataset"),
     "kfold":    ("kfold",               "split an existing dpdata dataset into K folds"),
     "decorate": ("decorate",             "template POSCAR + formula/label sheet -> dpdata"),
+    "tasks":    ("tasks",                "folds -> data/task.000y/{train,valid} per fold"),
     "config-from-xlsx": ("config_from_xlsx",
                          "derive a families: block from a measurement spreadsheet"),
     "convergence": ("convergence_x0",   "convergence analysis at x0"),
