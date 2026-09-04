@@ -17,12 +17,17 @@ either a genuine replicate or the same file passed twice.
 One frame per (structure, measurement).  The structure supplies coordinates and cell;
 the experiment supplies the label and the conditions it was measured at:
 
-    fparam   = [P_O2_high (atm), P_O2_low (atm), T]      per frame
+    fparam   = [P_O2_high (atm), P_O2_low (atm), T(C)]   per frame
 
 The spreadsheet's own temperature unit is read from its cells ('400 °C', '673 K') and
 converted to whatever --t-unit asks for.  An unlabelled sheet is assumed Celsius and says
 so loudly, because a bare 700 is an ordinary measurement in either unit and guessing it
 wrong shifts the whole temperature axis by a freezing point without any symptom.
+
+fparam is written in CELSIUS by default, the unit these measurements are made and recorded
+in.  --t-unit K converts.  The choice is only a convention, but it is a convention every
+consumer of the model has to share: whatever goes into fparam here is what has to come out
+of rl-matdesign's `fparam:` later, and nothing downstream can detect the difference.
     delta    = [dd]                                       per frame, the label
 
 WHY BOTH PRESSURES.  dd is not a property of a state, it is the change in oxygen content
@@ -447,9 +452,13 @@ def main(argv=None):
                     help="name of the label array; must equal property_name in the "
                          "deepmd input.json (default: delta)")
     ap.add_argument("--sets", default=None, help="comma list of set names to restrict to")
-    ap.add_argument("--t-unit", choices=["K", "C"], default="K",
-                    help="temperature unit written INTO fparam; the rest of this pipeline "
-                         "works in K, so K is the default")
+    ap.add_argument("--t-unit", choices=["K", "C"], default="C",
+                    help="temperature unit written INTO fparam (default C, matching the "
+                         "spreadsheets these labels come from).  --t-unit K converts.  "
+                         "Whatever you pick, every consumer of the model has to pass the "
+                         "SAME unit in fparam -- a model trained on C and queried in K is "
+                         "being asked about a temperature 273 degrees away from the one "
+                         "you meant")
     ap.add_argument("--sheet-t-unit", choices=["C", "K", "auto"], default="auto",
                     help="the unit the SPREADSHEET is in.  'auto' (default) reads the "
                          "sheet's own labels ('400 °C', '673 K') and falls back to C when "
@@ -767,7 +776,8 @@ def main(argv=None):
               f"{args.kfold} runs)")
     print(f"\n[*] index -> {idx_path}   (a 'split' column records which side each frame "
           f"went to)")
-    print(f"[*] sheet read as {sheet_unit}, fparam written in {args.t_unit}")
+    print(f"[*] sheet read as {sheet_unit}, fparam written in {args.t_unit}"
+          f"  <- query the model in {args.t_unit} too")
     print(f"[*] fparam is [P_high(atm), P_low(atm), T({args.t_unit})]"
           f"{' with pressures as log10' if args.p_log10 else ''}; "
           f"label file is {args.label_name}.npy")
