@@ -18,6 +18,11 @@ One frame per (structure, measurement).  The structure supplies coordinates and 
 the experiment supplies the label and the conditions it was measured at:
 
     fparam   = [P_O2_high (atm), P_O2_low (atm), T]      per frame
+
+The spreadsheet's own temperature unit is read from its cells ('400 °C', '673 K') and
+converted to whatever --t-unit asks for.  An unlabelled sheet is assumed Celsius and says
+so loudly, because a bare 700 is an ordinary measurement in either unit and guessing it
+wrong shifts the whole temperature axis by a freezing point without any symptom.
     delta    = [dd]                                       per frame, the label
 
 WHY BOTH PRESSURES.  dd is not a property of a state, it is the change in oxygen content
@@ -134,12 +139,16 @@ def site_fractions(counts):
 # --------------------------------------------------------------------------- the sheet
 
 # A temperature-row cell: a number, optionally carrying its unit as text.
-_TEMP_CELL = re.compile(r"^\s*([-+]?\d*\.?\d+)\s*(?:°\s*)?[CcKk\u2103]?\s*$")
+# \u2103 is the single-character DEGREE CELSIUS, \u212a the KELVIN SIGN -- both turn up
+# in spreadsheets that were typed rather than computed.
+_TEMP_CELL = re.compile(
+    r"^\s*([-+]?\d*\.?\d+)\s*(?:°\s*)?([CcKk]|\u2103|\u212a)?\s*$")
+_UNIT_OF = {"c": "C", "\u2103": "C", "k": "K", "\u212a": "K"}
 
 
 def parse_temperature(v):
     """
-    One cell of the temperature row -> float, or None if it is not a temperature.
+    One cell of the temperature row -> (value, unit) with unit "C", "K" or None.
 
     The columns used to be bare numbers and `float(cell)` was enough.  SCFM260817.xlsx
     writes them as text instead -- '400 °C' -- so every cell failed the isinstance check
@@ -149,19 +158,24 @@ def parse_temperature(v):
     float() rather than isinstance also fixes a latent case: a column of whole degrees
     comes back as numpy.int64, which is NOT an instance of int.
 
-    The unit is stripped, never converted.  --t-unit decides what goes into fparam and
-    the sheet is in C throughout, so a K-labelled column is a decision to make rather
-    than a silent +273.15 here.
+    The unit is now REPORTED rather than thrown away.  It used to be matched purely so
+    that '400 °C' would parse, and the sheet was then assumed Celsius no matter what it
+    said -- which means a Kelvin sheet had 273.15 added to temperatures that were already
+    Kelvin, silently, and the model trained on a temperature axis shifted by a whole
+    freezing point.  A bare number still yields None, because a number alone genuinely
+    does not say: 700 is a plausible measurement in either unit.
     """
     if isinstance(v, str):
         m = _TEMP_CELL.match(v.translate(_INVISIBLE))
-        return float(m.group(1)) if m else None
+        if not m:
+            return None, None
+        return float(m.group(1)), _UNIT_OF.get((m.group(2) or "").lower())
     if v is None or pd.isna(v):
-        return None
+        return None, None
     try:
-        return float(v)
+        return float(v), None
     except (TypeError, ValueError):
-        return None
+        return None, None
 
 
 def _sheet_arg(v):
@@ -213,9 +227,9 @@ def read_measurements(xlsx, sheet=0):
         end = blocks[i + 1][0] if i + 1 < len(blocks) else len(raw)
         temps = {}
         for c in range(raw.shape[1]):
-            t = parse_temperature(raw.iat[hdr + 1, c])
+            t, unit = parse_temperature(raw.iat[hdr + 1, c])
             if t is not None:
-                temps[c] = t
+                temps[c] = (t, unit)
         if not temps:
             raise SystemExit(f"[ERROR] {xlsx}: no temperature row under the block header "
                              f"at spreadsheet row {hdr + 2}.  Expected numbers, or text "
@@ -238,12 +252,13 @@ def read_measurements(xlsx, sheet=0):
                     break
             if label is None:
                 continue
-            for c, t in temps.items():
+            for c, (t, unit) in temps.items():
                 v = raw.iat[r, c]
                 if not isinstance(v, (int, float)) or pd.isna(v):
                     continue
                 rows.append({"formula_raw": str(label), "formula": clean_formula(label),
-                             "p_high_atm": p_hi, "p_low_atm": p_lo, "t_c": t,
+                             "p_high_atm": p_hi, "p_low_atm": p_lo,
+                             "t_sheet": t, "t_unit_sheet": unit,
                              "delta": float(v), "flagged": r in red_rows,
                              "source": os.path.basename(str(xlsx)),
                              "block": i + 1, "xlsx_row": r + 1})
@@ -251,7 +266,7 @@ def read_measurements(xlsx, sheet=0):
 
 
 # the columns that make one measurement the same measurement, for duplicate reporting
-_MEAS_KEY = ["formula", "p_high_atm", "p_low_atm", "t_c"]
+_MEAS_KEY = ["formula", "p_high_atm", "p_low_atm", "t_sheet"]
 
 
 def read_all_measurements(xlsxs, sheets):
@@ -294,6 +309,57 @@ def read_all_measurements(xlsxs, sheets):
             f"        `source` records the basename, so it could not tell the rows "
             f"apart.  Rename one, or copy them to distinct names first.")
     return meas
+
+
+def resolve_sheet_unit(meas, declared):
+    """
+    What unit the spreadsheet's temperatures are in -> ("C"|"K", how it was decided).
+
+    A label in the cell wins outright.  Labels that disagree with each other, or with an
+    explicit --sheet-t-unit, are an error: the sheet is then saying two things and only
+    the person who made it knows which is true.
+
+    With no label at all the number alone is usually not enough -- 700 is a perfectly
+    ordinary measurement in either unit -- so this does NOT guess.  The one case it can
+    settle is a sheet whose temperatures are all below 273.15, which cannot be Kelvin for
+    a solid-state measurement.  Everything else falls back to `declared`, and says so.
+    """
+    labels = {u for u in meas["t_unit_sheet"].dropna().unique()}
+    if len(labels) > 1:
+        where = (meas[meas["t_unit_sheet"].notna()]
+                 .groupby(["source", "t_unit_sheet"])["t_sheet"]
+                 .agg(lambda g: ", ".join(f"{v:g}" for v in sorted(set(g))[:4])))
+        raise SystemExit(
+            "[ERROR] the spreadsheet labels its temperatures with more than one unit:\n"
+            + "\n".join(f"        {src}: {unit} at {vals}"
+                         for (src, unit), vals in where.items())
+            + "\n        Fix the sheet, or pass --sheet-t-unit to say which is right "
+              "for all of it.")
+
+    if labels:
+        found = labels.pop()
+        if declared not in (None, "auto") and declared != found:
+            raise SystemExit(
+                f"[ERROR] --sheet-t-unit {declared} contradicts the spreadsheet, which "
+                f"labels its temperatures {found}.\n"
+                f"        One of the two is wrong and this cannot tell which; correct "
+                f"the sheet or drop the flag.")
+        return found, f"read from the sheet's own labels"
+
+    if declared not in (None, "auto"):
+        return declared, "--sheet-t-unit"
+
+    hottest = float(meas["t_sheet"].max())
+    if hottest < 273.15:
+        return "C", f"unlabelled, but the highest is {hottest:g} -- not Kelvin"
+    return "C", "unlabelled; ASSUMED (see the warning above)"
+
+
+def convert_temperature(values, src, dst):
+    """Celsius <-> Kelvin, or a no-op when the units already agree."""
+    if src == dst:
+        return values
+    return values + 273.15 if dst == "K" else values - 273.15
 
 
 def report_duplicates(meas):
@@ -382,8 +448,14 @@ def main(argv=None):
                          "deepmd input.json (default: delta)")
     ap.add_argument("--sets", default=None, help="comma list of set names to restrict to")
     ap.add_argument("--t-unit", choices=["K", "C"], default="K",
-                    help="temperature unit in fparam; the sheet is in C and the rest of "
-                         "this pipeline works in K, so K is the default")
+                    help="temperature unit written INTO fparam; the rest of this pipeline "
+                         "works in K, so K is the default")
+    ap.add_argument("--sheet-t-unit", choices=["C", "K", "auto"], default="auto",
+                    help="the unit the SPREADSHEET is in.  'auto' (default) reads the "
+                         "sheet's own labels ('400 °C', '673 K') and falls back to C when "
+                         "there are none -- a bare number does not say which it is.  Set "
+                         "it explicitly for an unlabelled Kelvin sheet, or the "
+                         "temperatures get 273.15 added to them twice")
     ap.add_argument("--p-log10", action="store_true",
                     help="store log10(P/atm) instead of P/atm -- the pressures span four "
                          "decades, which a linear feature represents badly")
@@ -434,9 +506,23 @@ def main(argv=None):
           + ", ".join(f"{name} ({n} pts)" for name, n in per_file.items()))
     print(f"[*] measurements : {len(meas)} over {meas['formula'].nunique()} compound(s), "
           f"{n_flagged} flagged unreliable")
+
+    sheet_unit, how = resolve_sheet_unit(meas, args.sheet_t_unit)
+    if how.startswith("unlabelled; ASSUMED"):
+        print(f"[!] the spreadsheet's temperatures carry no unit, and "
+              f"{meas['t_sheet'].min():g}-{meas['t_sheet'].max():g} is a plausible range "
+              f"in either C or K.\n"
+              f"[!] ASSUMING CELSIUS.  If the sheet is in Kelvin, pass "
+              f"--sheet-t-unit K -- otherwise every\n"
+              f"[!] temperature in fparam is 273.15 too high and nothing will complain.\n"
+              f"[!] Labelling one cell '{meas['t_sheet'].max():g} °C' or "
+              f"'{meas['t_sheet'].max():g} K' settles it for good.")
+    print(f"[*] sheet T unit : {sheet_unit}  ({how})")
+
     for (hi, lo), g in meas.groupby(["p_high_atm", "p_low_atm"]):
         print(f"[*]   window {hi:g} atm -> {lo:g} atm : {len(g)} point(s), "
-              f"T = {', '.join(f'{t:g}' for t in sorted(g['t_c'].unique()))} C")
+              f"T = {', '.join(f'{t:g}' for t in sorted(g['t_sheet'].unique()))} "
+              f"{sheet_unit}")
     report_duplicates(meas)
     if not args.keep_flagged and n_flagged:
         meas = meas[~meas["flagged"]].reset_index(drop=True)
@@ -485,7 +571,10 @@ def main(argv=None):
                               "formula": formula, "comp": comp_name[key],
                               "match_err": round(err, 6),
                               "p_high_atm": m["p_high_atm"], "p_low_atm": m["p_low_atm"],
-                              "t_c": m["t_c"], args.label_name: m["delta"],
+                              "t_sheet": m["t_sheet"], "t_unit_sheet": sheet_unit,
+                              "t_fparam": convert_temperature(
+                                  float(m["t_sheet"]), sheet_unit, args.t_unit),
+                              args.label_name: m["delta"],
                               "flagged": bool(m["flagged"]), "source": m["source"],
                               "block": m["block"], "xlsx_row": m["xlsx_row"]})
 
@@ -639,7 +728,8 @@ def main(argv=None):
             # is what varies, which is the whole point of a frame parameter.
             s.data["coords"] = np.repeat(s.data["coords"], n, axis=0)
             s.data["cells"] = np.repeat(s.data["cells"], n, axis=0)
-            t = g["t_c"].to_numpy(float) + (273.15 if args.t_unit == "K" else 0.0)
+            t = convert_temperature(g["t_sheet"].to_numpy(float), sheet_unit,
+                                    args.t_unit)
             p_hi, p_lo = g["p_high_atm"].to_numpy(float), g["p_low_atm"].to_numpy(float)
             if args.p_log10:
                 p_hi, p_lo = np.log10(p_hi), np.log10(p_lo)
@@ -677,6 +767,7 @@ def main(argv=None):
               f"{args.kfold} runs)")
     print(f"\n[*] index -> {idx_path}   (a 'split' column records which side each frame "
           f"went to)")
+    print(f"[*] sheet read as {sheet_unit}, fparam written in {args.t_unit}")
     print(f"[*] fparam is [P_high(atm), P_low(atm), T({args.t_unit})]"
           f"{' with pressures as log10' if args.p_log10 else ''}; "
           f"label file is {args.label_name}.npy")
