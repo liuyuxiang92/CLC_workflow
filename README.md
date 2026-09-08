@@ -140,6 +140,19 @@ Chaining fold-to-fold is not a convenience. One shared model from the previous r
 have trained on data from every fold, so every task's validation fold would already be in
 its model's history and the five scores would stop being a cross-validation.
 
+**`--link` for shared read-only inputs, `--model` for anything a run writes beside.**
+A stat file, an hdf5, a public dataset are only read, so they are symlinked into every task
+rather than duplicated K times — and a name the `input.json` gives relative,
+`"./OC22_CALM.hdf5"`, then resolves inside each task:
+
+```bash
+clc tasks . --upto iter_2 --out data_iter2 --input-template input.json \
+    --link OC22_CALM_with_fparam_0_1.hdf5 --model dpa4.ckpt.pt
+```
+
+Checkpoints are copied instead, and that asymmetry is the point: runs sharing one model file
+would overwrite each other's output the moment any of them saves beside it.
+
 **Pass the systems explicitly.** Every task writes `systems.json` naming its system
 directories one by one, and `--input-template` fills a copy of your `input.json` from that
 list. Handing deepmd the parent directory relies on a tree walk, which comes back empty

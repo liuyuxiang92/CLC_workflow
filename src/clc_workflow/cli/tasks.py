@@ -34,6 +34,11 @@ later rounds out; `--iters` names them outright.  Each round is a fresh K-fold o
 data collected so far, which is why the fold directories are re-read every time rather
 than a previous round's tasks being extended.
 
+`--link` symlinks shared read-only inputs into every task -- a stat file, an hdf5, a public
+dataset -- so one large input is not duplicated K times, and a relative name in the
+input.json ("./OC22_CALM.hdf5") resolves inside each task.  `--model` COPIES instead, which
+is the right default for a checkpoint precisely because a run writes beside it.
+
 `--model` copies one pretrained checkpoint into every task.  `--task-model` gives each task
 its own, which is what chains the rounds: fold k of round N continues from the model fold k
 produced in round N-1, and never from a model that has already trained on fold k's data.
@@ -197,6 +202,12 @@ def main(argv=None):
                          "other head is left exactly as the template has it, so a "
                          "public dataset mixed in beside the folds is not overwritten.  "
                          "Ignored for a single-task input.json")
+    ap.add_argument("--link", nargs="+", default=None,
+                    help="file(s) or directory(ies) SYMLINKED into every task directory "
+                         "-- a stat file, a shared hdf5, a public dataset: anything the "
+                         "runs only read.  Linked rather than copied so one large input "
+                         "is not duplicated per task.  Use --model for anything a run "
+                         "writes beside")
     ap.add_argument("--copy", action="store_true", default=True,
                     help="copy the fold directories (the default; kept so existing "
                          "commands still run)")
@@ -281,6 +292,20 @@ def main(argv=None):
             sys.exit(f"[ERROR] no such model file: {m}")
         models.append(os.path.abspath(m))
 
+    # Shared read-only inputs.  Resolved and checked before any directory is made, for the
+    # same reason --task-model is: a typo should fail with the path it tried rather than
+    # leave half a tree behind.  Absolute targets, so a link keeps resolving no matter how
+    # deep under --out the task sits.
+    links = []
+    for f in (args.link or []):
+        if not os.path.exists(f):
+            sys.exit(f"[ERROR] --link: no such file or directory: {f}")
+        links.append(os.path.abspath(f))
+    if links:
+        print(f"[*] linked        : "
+              + ", ".join(os.path.basename(f) for f in links)
+              + " -> symlinked into every task")
+
     # One model per task, either spelled out in task order or generated from a pattern.
     # Resolved and checked here, before any directory is made, so a wrong pattern fails
     # with the paths it tried rather than leaving a half-built tree behind.
@@ -327,6 +352,9 @@ def main(argv=None):
         if models:
             print(f"[*]   each with a copy of "
                   f"{', '.join(os.path.basename(m) for m in models)}")
+        if links:
+            print(f"[*]   each with a symlink to "
+                  f"{', '.join(os.path.basename(f) for f in links)}")
         for y in sorted(task_models):
             print(f"[*]   task {y:0{args.width}d} also gets "
                   f"{os.path.relpath(task_models[y])}")
@@ -369,6 +397,13 @@ def main(argv=None):
         with open(os.path.join(task, "systems.json"), "w") as fh:
             json.dump({"fold": k, "training_data": tr_paths,
                        "validation_data": va_paths}, fh, indent=2)
+        for f in links:
+            target = os.path.join(task, os.path.basename(f))
+            if os.path.islink(target) or os.path.isfile(target):
+                os.unlink(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
+            os.symlink(f, target)
         for m in models + ([task_models[y]] if y in task_models else []):
             target = os.path.join(task, os.path.basename(m))
             if os.path.islink(target):
@@ -389,7 +424,8 @@ def main(argv=None):
                 json.dump(cfg, fh, indent=2)
         n_models = len(models) + (1 if y in task_models else 0)
         extra = "".join([", input.json" if template is not None else "",
-                         f", {n_models} model file(s)" if n_models else ""])
+                         f", {n_models} model file(s)" if n_models else "",
+                         f", {len(links)} link(s)" if links else ""])
         print(f"[*] wrote {task}/  train: {len(tr_paths)} system(s), "
               f"valid: {len(va_paths)} system(s){extra}")
 
@@ -411,6 +447,11 @@ def main(argv=None):
         print(f"[*] each task also carries its own model, so fold k continues from what "
               f"fold k\n[*]   produced last round rather than from a model that has "
               f"already seen fold k")
+    if links:
+        print(f"[*] each task also links to "
+              f"{', '.join(os.path.basename(f) for f in links)}, so a name the input.json "
+              f"gives\n[*]   relative -- \"./{os.path.basename(links[0])}\" -- resolves "
+              f"inside the task without copying it per task")
     if not models and not task_models:
         print(f"[*] --model <checkpoint> copies one model into every task; --task-model "
               f"gives\n[*]   each task its own, for chaining rounds")
