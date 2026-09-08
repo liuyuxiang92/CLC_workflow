@@ -510,3 +510,8 @@ relying on shell env persisting into a detached/nohup training run.
   options survived it (`-k 5` parses as `-k` with value `" 5"`), which made the failure
   pattern look real rather than like a quoting bug. Use a `run() { "$@"; }` helper for
   parameterised CLI smoke tests in zsh.
+
+### EARS — Session Start (2026-09-08 18:59)
+<!-- concepts: k-fold cross-validation, deepmd multi-task training, CLI task scaffolding -->
+- Task: fix `clc tasks` so the per-fold training trees it builds are actually runnable — copy folds instead of symlinking, fill the multi-task `training.data_dict.property` systems key rather than the single-task `training.training_data`, and write task-relative paths.
+- Why: the user has iter_1..iter_7 each 5-folded and needs round-N training trees (`iterN_training/task.000y/{train,valid}`) whose `input.json` deepmd will actually read on the cluster.

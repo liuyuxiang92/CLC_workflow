@@ -24,8 +24,10 @@ which is a different question from the one the other tasks answer.
 
 The iteration and fold names are kept rather than flattened, so a task directory still says
 where each piece came from, and two iterations contributing the same fold index cannot
-collide.  Each fold is one link to the original directory; `--copy` writes real copies, for
-a filesystem where the training job cannot follow a link.
+collide.  Each fold is COPIED into the task, so a task directory is self-contained and can
+be shipped to the cluster whole; `--symlink` links instead, which is cheaper on disk but
+leaves a training job that cannot follow a link -- or a tree that has been moved -- reading
+an empty dataset.
 
 ROUND N TRAINS ON ITERATIONS 1..N.  `--upto iter_2` selects iter_1 and iter_2 and leaves
 later rounds out; `--iters` names them outright.  Each round is a fresh K-fold over the
@@ -45,9 +47,15 @@ each other's output the moment any of them saves beside it.
 
 PASS THE SYSTEMS EXPLICITLY, not the parent directory.  Every task writes systems.json
 naming its system directories one by one, and `--input-template` fills a copy of your
-input.json per task from that list.  Handing deepmd `train/` to walk instead would find
-nothing: a directory walk does not descend into a symlink, so the training set would come
-back empty with nothing obviously wrong.
+input.json per task from that list.  Handing deepmd `train/` to walk instead finds nothing
+when the folds are symlinked, since a directory walk does not descend into a link.
+
+THE PATHS WRITTEN ARE RELATIVE TO THE TASK DIRECTORY -- "./train/iter_1/fold_4/320" --
+because that is where input.json sits and the tree gets copied to wherever training runs.
+
+A MULTI-TASK input.json keeps its systems under training.data_dict.<head>, not under
+training.training_data, so `--data-key` names the head to fill (default: property) and
+every other head -- a public dataset trained alongside the folds -- is left untouched.
 """
 import argparse
 import fnmatch
@@ -121,8 +129,14 @@ def count_frames(sysdir):
 def place(dest, entries, copy):
     """
     Reproduce `entries` under `dest` as <iteration>/<fold name>, and return the system
-    directories at their new paths.
+    directories as paths RELATIVE TO THE TASK DIRECTORY -- "./train/iter_1/fold_4/320".
+
+    Relative because input.json sits in the task directory and the whole tree is copied
+    to wherever the training actually runs.  An absolute path baked in here names a
+    directory that does not exist on the cluster, and deepmd reports an empty dataset
+    rather than a missing one.
     """
+    task = os.path.dirname(dest) or "."
     out = []
     for iteration, fold_name, fold_dir, systems in entries:
         target = os.path.join(dest, iteration, fold_name) if iteration \
@@ -138,8 +152,8 @@ def place(dest, entries, copy):
             os.symlink(fold_dir, target)
         for sysdir in systems:
             rel = os.path.relpath(sysdir, fold_dir)
-            out.append(os.path.abspath(target if rel == "."
-                                       else os.path.join(target, rel)))
+            full = target if rel == "." else os.path.join(target, rel)
+            out.append("./" + os.path.relpath(full, task))
     return out
 
 
@@ -177,8 +191,20 @@ def main(argv=None):
                          "it.  Copied, not linked: a run that writes next to its model "
                          "must not write into the others.  Use --task-model when the "
                          "tasks need different models")
-    ap.add_argument("--copy", action="store_true",
-                    help="copy the fold directories instead of symlinking them")
+    ap.add_argument("--data-key", default="property",
+                    help="for a MULTI-TASK input.json -- one with training.data_dict -- "
+                         "which head gets the fold paths (default: property).  Every "
+                         "other head is left exactly as the template has it, so a "
+                         "public dataset mixed in beside the folds is not overwritten.  "
+                         "Ignored for a single-task input.json")
+    ap.add_argument("--copy", action="store_true", default=True,
+                    help="copy the fold directories (the default; kept so existing "
+                         "commands still run)")
+    ap.add_argument("--symlink", dest="copy", action="store_false",
+                    help="symlink the fold directories instead of copying them.  "
+                         "Cheaper on disk, but a training job that cannot follow a link "
+                         "-- or a task tree that gets copied to another machine, which "
+                         "leaves the links dangling -- then sees an empty dataset")
     ap.add_argument("--dry-run", action="store_true",
                     help="report the tasks and their sizes; write nothing")
     args = ap.parse_args(argv)
@@ -307,16 +333,34 @@ def main(argv=None):
         print("\n[dry-run] nothing written.")
         return
 
+    # WHERE THE SYSTEMS LISTS LIVE depends on the shape of the input.json.  A single-task
+    # run has one training.training_data; a multi-task run has training.data_dict.<head>,
+    # one per entry in model_dict, and writing training.training_data there would be
+    # ignored -- the run would train on whatever paths the template already carried.
     template = None
+    head = None
     if args.input_template:
         if not os.path.isfile(args.input_template):
             sys.exit(f"[ERROR] no such template: {args.input_template}")
         with open(args.input_template) as fh:
             template = json.load(fh)
-        for key in ("training_data", "validation_data"):
-            if key not in template.get("training", {}):
-                print(f"[warn] {args.input_template}: training.{key} is absent; "
-                      f"it will be created")
+        block = template.get("training", {})
+        if "data_dict" in block:
+            heads = list(block["data_dict"])
+            head = args.data_key
+            if head not in heads:
+                sys.exit(f"[ERROR] {args.input_template} is a multi-task input: its "
+                         f"training.data_dict holds {heads}, and --data-key "
+                         f"{head!r} is not one of them")
+            others = [h for h in heads if h != head]
+            print(f"[*] input.json   : multi-task -- filling "
+                  f"training.data_dict.{head}.[training|validation]_data.systems"
+                  + (f", leaving {others} as the template has them" if others else ""))
+        else:
+            for key in ("training_data", "validation_data"):
+                if key not in block:
+                    print(f"[warn] {args.input_template}: training.{key} is absent; "
+                          f"it will be created")
 
     for task, tr, va, k, y in plan:
         os.makedirs(task, exist_ok=True)
@@ -337,10 +381,10 @@ def main(argv=None):
                 shutil.copyfile(m, target)
         if template is not None:
             cfg = json.loads(json.dumps(template))
-            cfg.setdefault("training", {}).setdefault("training_data", {})
-            cfg["training"].setdefault("validation_data", {})
-            cfg["training"]["training_data"]["systems"] = tr_paths
-            cfg["training"]["validation_data"]["systems"] = va_paths
+            dest = cfg["training"]["data_dict"][head] if head is not None \
+                else cfg.setdefault("training", {})
+            dest.setdefault("training_data", {})["systems"] = tr_paths
+            dest.setdefault("validation_data", {})["systems"] = va_paths
             with open(os.path.join(task, "input.json"), "w") as fh:
                 json.dump(cfg, fh, indent=2)
         n_models = len(models) + (1 if y in task_models else 0)
@@ -352,9 +396,9 @@ def main(argv=None):
     how = "copies of" if args.copy else "symlinks to"
     print(f"\n[*] each task holds {how} the fold directories under train/<iter>/ and "
           f"valid/<iter>/,")
-    print(f"[*]   and systems.json names the system directories one by one -- give "
-          f"deepmd that")
-    print(f"[*]   list, not the parent, since a tree walk does not descend into a symlink")
+    print(f"[*]   and systems.json names the system directories one by one, relative to "
+          f"the task")
+    print(f"[*]   directory -- give deepmd that list, not the parent")
     if models:
         print(f"[*] each task carries its own copy of "
               f"{', '.join(os.path.basename(m) for m in models)}, so a run can "
