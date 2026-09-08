@@ -142,9 +142,31 @@ its model's history and the five scores would stop being a cross-validation.
 
 **Pass the systems explicitly.** Every task writes `systems.json` naming its system
 directories one by one, and `--input-template` fills a copy of your `input.json` from that
-list. Handing deepmd the parent directory relies on a tree walk, and a walk does not
-descend into a symlink — the training set would come back empty with nothing obviously
-wrong.
+list. Handing deepmd the parent directory relies on a tree walk, which comes back empty
+when the folds are links, since a walk does not descend into one.
+
+The paths written are **relative to the task directory** — `./train/iter_1/fold_4/320` —
+because that is where `input.json` sits and the tree gets copied to wherever training runs.
+An absolute path baked in at build time names a directory the cluster does not have.
+
+**Folds are copied into the task, not linked**, so a task directory is self-contained and
+survives being shipped elsewhere. `--symlink` links instead: cheaper on disk, but a training
+job that cannot follow a link — or a tree that has since been moved — reads an empty dataset
+rather than failing.
+
+A **multi-task** `input.json` keeps its systems under `training.data_dict.<head>` rather than
+under `training.training_data`, so `--data-key` names the head to fill (default `property`):
+
+```json
+"training": {"data_dict": {
+    "OC22":     {"training_data": {"systems": "/mnt/.../OC22_clean/train"}},
+    "property": {"training_data":   {"systems": ["./train/iter_1/fold_0/320", "..."]},
+                 "validation_data": {"systems": ["./valid/iter_1/fold_1/320", "..."]}}}}
+```
+
+Every other head is left as the template has it, so a public dataset trained alongside the
+folds is not overwritten. A single-task input has no `data_dict`, and its one
+`training.training_data` is filled instead.
 
 ## How paths resolve
 
