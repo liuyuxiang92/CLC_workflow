@@ -35,6 +35,13 @@ importable on PYTHONPATH in the same environment (this module imports
 ``rl_matdesign.predictors.builders.defect_site`` and
 ``rl_matdesign.utils.structure``).
 
+``build_sample(candidate, *, sample)`` implements rl-matdesign's explicit
+single-structure sampling protocol. Each descriptor's seed controls the defect
+configuration and the MD velocity draw (unless ``md.velocity_seed`` overrides
+the latter), so serial and parallel workers use the same random inputs
+regardless of scheduling order. Failed samples are
+reported by rl-matdesign under their original identities without replacement.
+
 ``md.env`` (optional dict, e.g. ``{DP_BACKEND_PLUGIN_PATH: /path/to/lib,
 LD_LIBRARY_PATH: ...}``) is merged into the LAMMPS subprocess's environment on
 top of the current process's own ``os.environ`` — some deepmd-kit builds need
@@ -73,9 +80,13 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import ase
+    from rl_matdesign.utils.structure_samples import StructureSample
 
 
 class MDAveragedOptBuilder:
@@ -190,6 +201,47 @@ class MDAveragedOptBuilder:
                 f"{len(results)}."
             )
         return results
+
+    def build_sample(
+        self,
+        candidate: Dict[str, Dict[str, Any]],
+        *,
+        sample: StructureSample,
+    ) -> "ase.Atoms":
+        """Build one declared realization; let the caller record any failure."""
+        from ase import Atoms
+        from rl_matdesign.utils.structure_samples import (
+            SamplingProtocolError,
+            StructureSample,
+            attach_sample_identity,
+            canonical_sample_candidate,
+        )
+
+        # DefectSiteBuilder owns one configured base_poscar, with both A and B
+        # sublattices. It uses the protocol's generic (no template ID) plan.
+        if not isinstance(sample, StructureSample) or any(
+            value is not None
+            for value in (sample.template_index, sample.template_path, sample.site_symbol)
+        ):
+            raise SamplingProtocolError(
+                "MDAveragedOptBuilder requires a generic StructureSample without template metadata"
+            )
+
+        rng = np.random.default_rng(sample.seed)
+        raw_structures = self._inner.build(
+            canonical_sample_candidate(candidate), n_configs=1, rng=rng
+        )
+        if len(raw_structures) != 1 or not isinstance(raw_structures[0], Atoms):
+            raise SamplingProtocolError(
+                "MDAveragedOptBuilder requires exactly one ASE Atoms from DefectSiteBuilder"
+            )
+        atoms = self._md_average_and_optimize(
+            raw_structures[0], tag=sample.sample_index, rng=rng
+        )
+        if not isinstance(atoms, Atoms):
+            raise SamplingProtocolError("MD/optimization must return exactly one ASE Atoms")
+        attach_sample_identity(atoms, sample)
+        return atoms
 
     def composition_formula(self, candidate: Dict[str, Dict[str, Any]]) -> Optional[str]:
         fn = getattr(self._inner, "composition_formula", None)
