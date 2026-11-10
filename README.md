@@ -234,6 +234,41 @@ and `clc delta` additionally need `openpyxl` (from `analysis`) to read the sprea
 `dpdata` to read a POSCAR; `dpdata` is not declared here, since anywhere you are building
 a deepmd training set already has it.
 
+## rl-matdesign structure sampling
+
+`clc_workflow.rl_builder:MDAveragedOptBuilder` supports the explicit
+`build_sample(candidate, *, sample)` interface used by rl-matdesign's
+`codex/general-refactor` structure sources, including `structure_parallel`.
+One descriptor produces one defect configuration followed by MD, trajectory
+averaging, and geometry optimization. Its seed controls the configuration and
+the MD velocity draw; an explicit `md.velocity_seed` still takes precedence.
+Scheduling order does not change these random inputs. Numerical reproducibility
+of MD/optimization also depends on the engine, model, hardware, and settings.
+Failed samples keep their identities in rl-matdesign's diagnostics and are not
+replaced with extra attempts. The native `build(..., n_configs=..., rng=...)`
+entry point remains available. Refactored rl-matdesign uses the new per-sample
+seed protocol for both serial and parallel scoring; the same global seed does
+not promise to reproduce the older native ensemble's individual structures.
+
+If training stops at warmup with `Seeded parallel execution requires explicit
+build_sample`, update the CLC source installed in the **same Python environment**
+that runs `rl-matdesign`. From this CLC checkout:
+
+```bash
+python -m pip install -e '.[rl_reward]'
+python -c 'import inspect; from clc_workflow.rl_builder import MDAveragedOptBuilder as B; print(inspect.getfile(B)); print("build_sample:", callable(getattr(B, "build_sample", None)))'
+```
+
+The printed path must point to this updated source and the capability must be
+`True`. Updating rl-matdesign alone does not update this separate package.
+The protocol tests require ASE, pytest, and the refactored rl-matdesign package
+in the environment; they use real defect construction while mocking the
+expensive MD/optimization step:
+
+```bash
+python -m pytest tests/test_rl_sample_protocol.py tests/test_rl_parallel_samples.py
+```
+
 ## Longer documentation
 
 The case-level `README.md` that ships beside a working case goes much deeper: the

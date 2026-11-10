@@ -515,3 +515,18 @@ relying on shell env persisting into a detached/nohup training run.
 <!-- concepts: k-fold cross-validation, deepmd multi-task training, CLI task scaffolding -->
 - Task: fix `clc tasks` so the per-fold training trees it builds are actually runnable — copy folds instead of symlinking, fill the multi-task `training.data_dict.property` systems key rather than the single-task `training.training_data`, and write task-relative paths.
 - Why: the user has iter_1..iter_7 each 5-folded and needs round-N training trees (`iterN_training/task.000y/{train,valid}`) whose `input.json` deepmd will actually read on the cluster.
+
+### 2026-11-10 — Direct CLC adaptation to explicit RL structure samples
+<!-- concepts: explicit-sampling, external-builders, reproducibility -->
+- The refactored RL worker rejected MDAveragedOptBuilder before the first DQN warmup sample because only native build() was implemented. This precedes CSV writing and scientific MD execution.
+- Added build_sample directly in the owning CLC source, as requested. One descriptor owns one canonical defect configuration plus MD/optimization, sharing its RNG; retain configured velocity_seed overrides, existing native build(), and pre-existing timing changes. Failures propagate to the RL sample ledger without replacement.
+- Reviewed serial as well as parallel selection: both now use per-sample seeds; old native ensemble structures are not guaranteed at the same global seed. No generic implicit ensemble splitting or protocol guard removal.
+- Validation: 17 CLC regression tests pass, including real defect construction and real worker subprocesses with CPU MD/CUDA stand-ins. 124 RL protocol tests pass. Ruff and diff whitespace checks pass. No real LAMMPS/DeepMD/GPU validation on this host.
+- Worker failure diagnostics include tracebacks, while serial diagnostics contain exception summaries; regression comparisons preserve identity/status and verify the matching terminal error rather than requiring identical text.
+- Direct CLC edits are local on feat/group-kfold. The CLC remote has not been pushed; previous push authorization was for rl-matdesign. Server deployment must update the CLC package imported by the training interpreter.
+
+### 2026-11-10 — Prepare authorized CLC push
+<!-- concepts: scoped-commits, explicit-sampling -->
+- User explicitly requested pushing CLC_workflow. Fetched origin and verified feat/group-kfold was 0 ahead / 0 behind its upstream before this commit.
+- Commit only the build_sample adaptation, two regression test modules, README and diagnostic memory/trace. Preserve the pre-existing timing_stages and timed_stage MD changes locally, outside this commit.
+- Revalidated the exact source prepared for this commit: 17 tests passed with mocked MD/CUDA and real construction/worker processes; Ruff passed. Prior RL protocol suite: 124 passed. Independent pre-push review found no blockers or unrelated artifacts.

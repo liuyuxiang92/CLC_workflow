@@ -1,0 +1,19 @@
+- id: pitfall-rl-explicit-sampling-001
+  date: '2026-11-10'
+  expires: '2027-02-10'
+  title: External builders must implement the refactored RL sampling contract
+  wrong: Updating rl-matdesign while leaving the CLC builder with only build()
+    causes seeded parallel execution to fail at the worker capability handshake.
+  right: Implement build_sample(candidate, sample=...) in the owning CLC package.
+    Build exactly one configuration with a canonical candidate and a generator
+    seeded from the descriptor, then continue that generator into MD. Preserve
+    md.velocity_seed overrides and propagate failures with their sample identities.
+    Verify the actual imported CLC source in the training Python environment.
+  impact: DQN warmup stops at 0/400 with SamplingProtocolError before MD starts.
+    Both serial and parallel refactored scoring select the new sample protocol;
+    identical global seeds do not reproduce the legacy native ensemble stream.
+  files:
+    - src/clc_workflow/rl_builder.py
+    - tests/test_rl_sample_protocol.py
+    - tests/test_rl_parallel_samples.py
+  tags: [external-builders, reproducible-sampling, runtime-compatibility]
